@@ -1,0 +1,2527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Divine Misfortune</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js">
+/* ══════════════════════════════════════════
+   SHOP SYSTEM
+══════════════════════════════════════════ */
+
+// Shop upgrades — each has levels, each level costs more and boosts win chance
+const SHOP_ITEMS = [
+  {
+    id: 'lucky_charm',
+    name: "Lucky Charm",
+    icon: '🍀',
+    desc: "The gods whisper your name. Increase base win chance.",
+    maxLevel: 3,
+    baseCost: 150,
+    costMult: 2.2,
+    // bonus: extra chance to land higher-value symbols
+    effect: 'luck'
+  },
+  {
+    id: 'hermes_speed',
+    name: "Hermes' Blessing",
+    icon: '🪽',
+    desc: "Swift-footed Hermes tips the reels. Wilds appear more often.",
+    maxLevel: 3,
+    baseCost: 200,
+    costMult: 2.5,
+    effect: 'wild_rate'
+  },
+  {
+    id: 'poseidon_wave',
+    name: "Poseidon's Favour",
+    icon: '🔱',
+    desc: "The sea-god floods your paylines. Higher multipliers on wins.",
+    maxLevel: 3,
+    baseCost: 300,
+    costMult: 2.2,
+    effect: 'multiplier'
+  },
+  {
+    id: 'zeus_thunder',
+    name: "Zeus' Thunder",
+    icon: '⚡',
+    desc: "Father of the gods protects your bet. One loss prevention per session.",
+    maxLevel: 2,
+    baseCost: 400,
+    costMult: 3.0,
+    effect: 'loss_shield'
+  },
+  {
+    id: 'athena_wisdom',
+    name: "Athena's Wisdom",
+    icon: '🦉',
+    desc: "Wisdom of the owl. Scatter symbol chance greatly increased.",
+    maxLevel: 2,
+    baseCost: 350,
+    costMult: 2.8,
+    effect: 'scatter_rate'
+  },
+  {
+    id: 'midas_touch',
+    name: "Midas Touch",
+    icon: '👑',
+    desc: "Everything you touch turns to gold. Win amount bonus on all paylines.",
+    maxLevel: 3,
+    baseCost: 500,
+    costMult: 2.0,
+    effect: 'win_bonus'
+  }
+];
+
+// Current upgrade levels (0 = not bought)
+const shopLevels = {
+  lucky_charm: 0,
+  hermes_speed: 0,
+  poseidon_wave: 0,
+  zeus_thunder: 0,
+  athena_wisdom: 0,
+  midas_touch: 0
+};
+
+// Loss shield counter
+let lossShieldsLeft = 0;
+
+// Compute cost for next level of an item
+function shopItemCost(item) {
+  const lvl = shopLevels[item.id];
+  if (lvl >= item.maxLevel) return null;
+  return Math.round(item.baseCost * Math.pow(item.costMult, lvl));
+}
+
+// Get effective luck multiplier (0 to 1 range extra chance)
+function getShopEffect(effect) {
+  for (const item of SHOP_ITEMS) {
+    if (item.effect === effect) return shopLevels[item.id];
+  }
+  return 0;
+}
+
+// Modified randSym that respects shop upgrades
+const _origRandSym = randSym; // keep reference
+
+function randSymShop() {
+  const r = Math.random();
+
+  // Athena: scatter rate +0.6% per level
+  const scatterBonus = getShopEffect('scatter_rate') * 0.006;
+  // Hermes: wild rate +0.8% per level
+  const wildBonus = getShopEffect('wild_rate') * 0.008;
+  // Lucky charm: shifts symbol pool toward better symbols
+  const luckLvl = getShopEffect('luck');
+
+  const obolThresh   = 0.004;
+  const scatterThresh = 0.011 + scatterBonus;
+  const wildThresh    = 0.023 + wildBonus;
+
+  if (r < obolThresh)   return OBOL;
+  if (r < scatterThresh) return SCATTER;
+  if (r < wildThresh)   return WILD;
+
+  // Lucky charm: higher chance of premium symbols
+  if (luckLvl > 0) {
+    // Re-roll and pick from a reduced pool (fewer temples, more high symbols)
+    const premiumPool = [];
+    const luckFactor = luckLvl;
+    const base = [...symPool];
+    // Remove 2 temples per luck level to improve odds
+    for (let i = 0; i < luckFactor * 2; i++) {
+      const idx = base.indexOf('temple');
+      if (idx !== -1) base.splice(idx, 1);
+    }
+    return base[Math.floor(Math.random() * base.length)];
+  }
+
+  return symPool[Math.floor(Math.random() * symPool.length)];
+}
+
+// Override global randSym with shop version
+// We do this by patching the usage sites via a wrapper
+window._shopRandSym = randSymShop;
+
+// Patch win calculation with Midas multiplier
+function applyMidasBonus(amount) {
+  const midasLvl = getShopEffect('win_bonus');
+  if (midasLvl === 0) return amount;
+  const bonusPct = [0, 0.20, 0.45, 0.80][midasLvl] || 0;
+  return Math.round(amount * (1 + bonusPct));
+}
+
+// Patch Poseidon multiplier on lineBet
+function getPoseidonMult() {
+  const lvl = getShopEffect('multiplier');
+  return [1, 1.25, 1.55, 1.90][lvl] || 1;
+}
+
+/* ── SHOP UI ─────────────────────────────── */
+
+function openShop() {
+  if (gs !== S_IDLE) return; // only open when not spinning
+  document.getElementById('shop-bal').innerText = fmtNum(souls);
+  renderShopItems();
+  document.getElementById('shop-overlay').classList.add('open');
+}
+
+function closeShop() {
+  document.getElementById('shop-overlay').classList.remove('open');
+}
+
+function renderShopItems() {
+  const grid = document.getElementById('shop-grid');
+  grid.innerHTML = '';
+  for (const item of SHOP_ITEMS) {
+    const lvl = shopLevels[item.id];
+    const cost = shopItemCost(item);
+    const maxed = lvl >= item.maxLevel;
+    const cantAfford = !maxed && cost > souls;
+
+    const el = document.createElement('div');
+    el.className = 'shop-item' + (maxed ? ' maxed' : '') + (cantAfford ? ' cant-afford' : '');
+
+    // Active badge if any level purchased
+    const activeBadge = lvl > 0 ? '<div class="active-badge">✔ ACTIVE</div>' : '';
+
+    // Level dots
+    let dots = '';
+    for (let i = 0; i < item.maxLevel; i++) {
+      dots += `<div class="dot ${i < lvl ? 'filled' : ''}"></div>`;
+    }
+
+    // Price label
+    let priceHtml = '';
+    if (maxed) {
+      priceHtml = '<div class="shop-item-price maxed-lbl">MAXED ✦</div>';
+    } else {
+      priceHtml = `<div class="shop-item-price">⚜ ${fmtNum(cost)} souls</div>`;
+    }
+
+    el.innerHTML = `
+      ${activeBadge}
+      <div class="shop-item-icon">${item.icon}</div>
+      <div class="shop-item-name">${item.name}</div>
+      <div class="shop-item-desc">${item.desc}</div>
+      <div class="shop-item-level">${dots}</div>
+      ${priceHtml}
+    `;
+
+    if (!maxed && !cantAfford) {
+      el.addEventListener('click', () => purchaseItem(item));
+    }
+
+    grid.appendChild(el);
+  }
+}
+
+function purchaseItem(item) {
+  const cost = shopItemCost(item);
+  if (cost === null || souls < cost) return;
+
+  souls -= cost;
+  shopLevels[item.id]++;
+  credEl.innerText = souls;
+
+  // Special effect: Zeus Thunder adds a loss shield
+  if (item.effect === 'loss_shield') {
+    lossShieldsLeft++;
+  }
+
+  // Update shop display
+  document.getElementById('shop-bal').innerText = fmtNum(souls);
+  renderShopItems();
+
+  // Visual feedback
+  sfx('obol');
+  spawnFloatWin('+' + item.name, window.innerWidth / 2, window.innerHeight / 2 - 60, '1.6rem', '#ffe566');
+  coinShower(12);
+
+  // Flash panel
+  const panel = document.querySelector('.shop-panel');
+  panel.classList.remove('purchase-flash');
+  void panel.offsetWidth;
+  panel.classList.add('purchase-flash');
+}
+
+/* ── K KEY — toggle shop ──────────────────── */
+document.addEventListener('keydown', e => {
+  if (e.key === 'k' || e.key === 'K') {
+    e.preventDefault();
+    const overlay = document.getElementById('shop-overlay');
+    if (overlay.classList.contains('open')) {
+      closeShop();
+    } else {
+      openShop();
+    }
+  }
+});
+
+/* ══════════════════════════════════════════
+   PATCH GAME ENGINE WITH SHOP EFFECTS
+══════════════════════════════════════════ */
+
+// Patch randSym globally — replace all usages that go through the game loop
+// The game uses randSym() in startPhysical, visualInterval, and stopReel.
+// We override the function itself.
+const _originalRandSym = randSym;
+// Redefine randSym to use shop version
+window.randSym = function() { return randSymShop(); };
+// Since JS closures in the game code already captured the original randSym,
+// we need to override via the same variable. We'll patch the body via
+// reassigning the existing randSym reference in the global scope.
+
+// Patch checkPaylines to apply Poseidon + Midas bonuses
+const _origCheckPaylines = checkPaylines;
+window.checkPaylines = function() {
+  const result = _origCheckPaylines();
+  const posMult = getPoseidonMult();
+  const midasLvl = getShopEffect('win_bonus');
+  const bonusPct = [0, 0.20, 0.45, 0.80][midasLvl] || 0;
+  // Apply multipliers
+  let total = 0;
+  result.winningLines.forEach(line => {
+    let w = line.winAmount * posMult * (1 + bonusPct);
+    w = Math.round(w);
+    line.winAmount = w;
+    total += w;
+  });
+  result.totalWin = total;
+  return result;
+};
+
+// Patch spin() to apply Zeus loss shield
+const _origSpin = spin;
+window.spin = function() {
+  // Zeus shield: refund bet on would-be loss (applied in rollback instead — see below)
+  _origSpin();
+};
+
+// Add shop hint to status footer
+document.addEventListener('DOMContentLoaded', () => {
+  const footer = document.querySelector('.status-footer');
+  if (footer) {
+    const hint = document.createElement('span');
+    hint.className = 'shop-hint';
+    hint.innerHTML = '[<span class="kbd">K</span>] SHOP';
+    footer.appendChild(hint);
+  }
+});
+
+// Inline add hint since DOM is ready
+(function addShopHint() {
+  const footer = document.querySelector('.status-footer');
+  if (footer) {
+    const hint = document.createElement('span');
+    hint.className = 'shop-hint';
+    hint.innerHTML = '[<span class="kbd">K</span>] SHOP';
+    footer.appendChild(hint);
+  }
+})();
+
+// Zeus shield: in rollback, if no win and shield available, refund the bet
+const _origRollback = rollback;
+window.rollback = function() {
+  if (lossShieldsLeft > 0 && activeWinData && activeWinData.totalWin === 0 && !isWildRespin && !inBonus) {
+    lossShieldsLeft--;
+    souls += bet;
+    credEl.innerText = souls;
+    hudBump(credEl);
+    setMsg('⚡ Zeus Shield Activated! Bet Refunded!', '#00d4ff');
+    spawnFloatWin('SHIELDED!', window.innerWidth / 2, window.innerHeight / 3, '2rem', '#00d4ff');
+    sfx('tierHit', 1);
+  }
+  _origRollback();
+};
+
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@400;600;700;900&family=IM+Fell+English:ital@1&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════
+   VARIABLES
+═══════════════════════════════════════ */
+:root {
+  --gold:      #d4af37;
+  --gold-hi:   #fff5b0;
+  --gold-glow: #ffe566;
+  --gold-dk:   #7a5000;
+  --gold-mid:  #c8960c;
+  --fire:      #ff6b00;
+  --hades:     #cf352e;
+  --zeus:      #00d4ff;
+  --zeus-dk:   #0080aa;
+  --wood:      #2a1100;
+  --wood2:     #4a1f00;
+  --copper:    #b45300;
+  --smoke:     rgba(0,0,0,0.55);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+
+/* ═══════════════════════════════════════
+   BODY — darkened so reels dominate
+═══════════════════════════════════════ */
+body {
+  background: url('slot-background.jpg') center/cover no-repeat fixed;
+  font-family:'Cinzel',serif;
+  color:#f0e8d8;
+  user-select:none;
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  min-height:100vh;
+}
+/* Heavy darkening vignette — background art is ambient, not dominant */
+body::before {
+  content:'';position:fixed;inset:0;
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 50%, rgba(6,2,0,0.55) 0%, rgba(2,0,0,0.82) 60%, rgba(0,0,0,0.96) 100%);
+  pointer-events:none;z-index:0;
+}
+/* subtle blur on background art */
+body::after {
+  content:'';position:fixed;inset:0;
+  backdrop-filter: blur(2px);
+  pointer-events:none;z-index:0;
+}
+body.bonus-mode::before { background:radial-gradient(ellipse 70% 80% at 50% 50%, rgba(40,3,3,0.65) 0%, rgba(16,0,0,0.92) 100%); }
+body.full-tartarus      { animation:vShk .08s infinite!important; }
+body.full-tartarus::before { background:radial-gradient(ellipse 70% 80% at 50% 50%, rgba(150,0,0,0.75) 0%, rgba(60,0,0,0.96) 100%)!important; }
+body.shake        { animation:sShk .4s infinite; }
+body.violent-shake{ animation:vShk .14s infinite; }
+@keyframes sShk{0%{transform:translate(1px,1px)}25%{transform:translate(-3px,-2px) rotate(-.8deg)}50%{transform:translate(2px,3px) rotate(.8deg)}75%{transform:translate(-2px,-3px)}100%{transform:translate(3px,2px) rotate(-.5deg)}}
+@keyframes vShk{0%{transform:translate(5px,5px)}25%{transform:translate(-8px,-6px) rotate(-2deg)}50%{transform:translate(6px,8px) rotate(2deg)}75%{transform:translate(-7px,-7px)}100%{transform:translate(8px,5px) rotate(-2deg)}}
+
+/* ═══════════════════════════════════════
+   SHELL
+═══════════════════════════════════════ */
+#shell {
+  position:relative;z-index:1;
+  display:flex;flex-direction:column;align-items:stretch;justify-content:stretch;
+  width:100vw;height:100vh;
+  max-width:100%;
+  gap:0;padding:0;overflow:hidden;
+}
+
+/* ═══════════════════════════════════════
+   JACKPOT METERS — prominent, animated
+═══════════════════════════════════════ */
+.jp-strip { display:flex;gap:4px;width:100%;flex-shrink:0; }
+.jp-box {
+  flex:1;text-align:center;
+  font-family:'Cinzel Decorative',cursive;
+  font-size:clamp(.48rem,.65vw,.68rem);
+  letter-spacing:1px;text-transform:uppercase;
+  padding:4px 6px;
+  border-radius:8px;
+  border:1.5px solid;
+  line-height:1.25;
+  position:relative;overflow:hidden;
+  cursor:default;
+  transition:transform .2s;
+}
+.jp-box:hover { transform:scale(1.02); }
+/* shimmer sweep */
+.jp-box::before {
+  content:'';position:absolute;top:0;left:-60%;width:40%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent);
+  animation:jpShimmer 3s linear infinite;
+}
+@keyframes jpShimmer{0%{left:-60%}100%{left:160%}}
+.jp-icon { font-size:clamp(.7rem,.9vw,.95rem);display:block;margin-bottom:1px;line-height:1; }
+.jp-lbl  { display:block;font-size:clamp(.42rem,.55vw,.58rem);letter-spacing:2px;opacity:.85; }
+.jp-val  { display:block;font-family:'Cinzel',serif;font-size:clamp(.85rem,1.4vw,1.2rem);font-weight:900;letter-spacing:0;margin-top:1px; }
+/* tier colours */
+.jp-mega  {
+  color:var(--zeus);border-color:rgba(0,212,255,.55);
+  background:linear-gradient(160deg,rgba(0,20,40,.85),rgba(0,40,70,.75));
+  box-shadow:0 0 20px rgba(0,212,255,.25),0 0 40px rgba(0,212,255,.1),inset 0 1px 0 rgba(0,212,255,.3);
+  animation:jpPulseMega 2s ease-in-out infinite;
+}
+.jp-major {
+  color:var(--gold-glow);border-color:rgba(255,229,102,.55);
+  background:linear-gradient(160deg,rgba(40,26,0,.85),rgba(70,45,0,.75));
+  box-shadow:0 0 20px rgba(255,229,102,.2),0 0 40px rgba(255,229,102,.08),inset 0 1px 0 rgba(255,229,102,.25);
+  animation:jpPulseMajor 2.4s ease-in-out infinite;
+}
+.jp-minor {
+  color:var(--fire);border-color:rgba(255,107,0,.55);
+  background:linear-gradient(160deg,rgba(40,12,0,.85),rgba(65,18,0,.75));
+  box-shadow:0 0 20px rgba(255,107,0,.2),0 0 40px rgba(255,107,0,.08),inset 0 1px 0 rgba(255,107,0,.25);
+  animation:jpPulseMinor 2.8s ease-in-out infinite;
+}
+@keyframes jpPulseMega  {0%,100%{box-shadow:0 0 20px rgba(0,212,255,.25),inset 0 1px 0 rgba(0,212,255,.3)}50%{box-shadow:0 0 35px rgba(0,212,255,.5),0 0 60px rgba(0,212,255,.2),inset 0 1px 0 rgba(0,212,255,.5)}}
+@keyframes jpPulseMajor {0%,100%{box-shadow:0 0 20px rgba(255,229,102,.2),inset 0 1px 0 rgba(255,229,102,.25)}50%{box-shadow:0 0 35px rgba(255,229,102,.45),0 0 60px rgba(255,229,102,.18),inset 0 1px 0 rgba(255,229,102,.5)}}
+@keyframes jpPulseMinor {0%,100%{box-shadow:0 0 20px rgba(255,107,0,.2),inset 0 1px 0 rgba(255,107,0,.25)}50%{box-shadow:0 0 35px rgba(255,107,0,.45),0 0 60px rgba(255,107,0,.18),inset 0 1px 0 rgba(255,107,0,.5)}}
+/* JP value tick animation */
+.jp-val.tick { animation:jpTick .15s ease-out; }
+@keyframes jpTick{0%{transform:scale(1.2);color:#fff}100%{transform:scale(1)}}
+
+/* ═══════════════════════════════════════
+   HUD — gold gradient bar
+═══════════════════════════════════════ */
+.hud {
+  display:flex;width:100%;flex-shrink:0;
+  background:linear-gradient(90deg, rgba(16,5,0,.92) 0%, rgba(35,14,0,.96) 50%, rgba(16,5,0,.92) 100%);
+  border:1.5px solid rgba(212,175,55,.35);
+  border-radius:8px;overflow:hidden;
+  backdrop-filter:blur(14px);
+  box-shadow:0 4px 28px rgba(0,0,0,.7),inset 0 1px 0 rgba(212,175,55,.18),0 0 0 1px rgba(0,0,0,.5);
+}
+.hc {
+  flex:1;padding:5px 4px;
+  display:flex;flex-direction:column;align-items:center;gap:1px;
+  border-right:1px solid rgba(212,175,55,.12);
+  font-size:clamp(.6rem,.8vw,.85rem);letter-spacing:1px;text-transform:uppercase;
+  color:rgba(212,175,55,.6);
+}
+.hc:last-child{border-right:none;}
+.hc-icon { font-size:clamp(.6rem,.8vw,.85rem);line-height:1;margin-bottom:1px; }
+.hc .hv { font-size:clamp(.8rem,1.35vw,1.1rem);font-weight:900;color:#fff;letter-spacing:1px; }
+.hc.obol .hv { color:var(--gold-glow);text-shadow:0 0 10px var(--gold-glow);animation:oGlow 1.2s infinite alternate; }
+@keyframes oGlow{0%{opacity:.85}100%{opacity:1;text-shadow:0 0 18px var(--gold-glow),0 0 35px var(--gold-glow);}}
+/* win value bump */
+.hv.bump { animation:hudBump .3s ease-out; }
+@keyframes hudBump{0%{transform:scale(1.35);color:var(--gold-glow)}100%{transform:scale(1)}}
+
+/* ═══════════════════════════════════════
+   TITLE
+═══════════════════════════════════════ */
+.title-wrap {display:none;}
+.title-orn {display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:2px;}
+.orn-bar {height:1px;flex:1;max-width:80px;background:linear-gradient(90deg,transparent,var(--gold),transparent);}
+.orn-sym {color:var(--gold);font-size:.9rem;filter:drop-shadow(0 0 6px var(--gold));}
+h1 {
+  font-family:'Cinzel Decorative',cursive;
+  font-size:clamp(1.35rem,3.8vw,2.7rem);font-weight:900;
+  background:linear-gradient(180deg,#fffbe8 0%,var(--gold-glow) 30%,var(--gold) 60%,var(--gold-dk) 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  letter-spacing:clamp(3px,.8vw,8px);
+  filter:drop-shadow(0 3px 18px rgba(212,175,55,.7));
+}
+.subtitle {
+  font-family:'IM Fell English',serif;font-style:italic;
+  font-size:clamp(.58rem,.85vw,.8rem);color:rgba(200,165,80,.55);letter-spacing:1px;margin-top:1px;
+}
+
+/* ═══════════════════════════════════════
+   CABINET — solid wood, prominent
+═══════════════════════════════════════ */
+.cabinet {
+  width:100%;flex:1;min-height:0;
+  position:relative;
+  display:flex;flex-direction:column;
+  background:linear-gradient(175deg,#a85a10 0%,#7a3a08 35%,#5c2600 65%,#3e1800 100%);
+  border-radius:0;border:none;outline:none;box-shadow:none;
+}
+.cabinet::before,.cabinet::after{content:none;}
+
+/* ── HEADER ── */
+.cab-head {
+  position:relative;z-index:1;flex-shrink:0;
+  background:linear-gradient(180deg,#c87020 0%,#a05010 60%,#7a3408 100%);
+  border-radius:0;
+  border-bottom:3px solid #1a0a00;
+  padding:6px 60px 4px;flex-shrink:0;
+  text-align:center;
+  box-shadow:inset 0 2px 0 rgba(255,200,80,.45),inset 0 -1px 0 rgba(0,0,0,.5);
+}
+.cab-head::before,.cab-head::after {
+  content:'';position:absolute;top:50%;transform:translateY(-50%);
+  width:28px;height:28px;border-radius:50%;
+  background:radial-gradient(circle at 38% 36%,#e8b030,#8a5000);
+  border:2px solid #1a0800;
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.6),0 2px 4px rgba(0,0,0,.5),0 0 8px rgba(212,175,55,.3);
+}
+.cab-head::before{left:18px;} .cab-head::after{right:18px;}
+.cab-head-title {
+  font-family:'Cinzel Decorative',cursive;
+  font-size:clamp(1rem,1.8vw,1.5rem);font-weight:900;
+  color:#ffe8a0;letter-spacing:clamp(3px,.7vw,6px);
+  text-shadow:0 2px 0 rgba(0,0,0,.6),0 0 20px rgba(255,200,80,.5),0 0 40px rgba(255,150,0,.2);
+}
+.head-ornaments {
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  font-size:.75rem;color:rgba(255,180,60,.5);margin-top:2px;
+  filter:drop-shadow(0 0 4px rgba(212,175,55,.3));
+}
+
+/* ── BODY ── */
+.cab-body {
+  position:relative;z-index:1;
+  flex:1;min-height:0;display:flex;flex-direction:column;
+  padding:6px 10px 0;
+}
+.cab-body::before,.cab-body::after{content:none;}
+
+/* ═══════════════════════════════════════
+   GOLDEN FRAME + BEZEL — THE KEY UPGRADE
+═══════════════════════════════════════ */
+.reel-frame {
+  flex:1;min-height:0;display:flex;flex-direction:column;
+  position:relative;
+  background:linear-gradient(135deg,#d4af37 0%,#ffe566 20%,#c8960c 40%,#ffe566 60%,#d4af37 80%,#8a6a10 100%);
+  border-radius:12px;
+  padding:4px;
+  box-shadow:
+    0 0 0 2px #2a1100,
+    0 0 30px rgba(212,175,55,.6),
+    0 0 60px rgba(212,175,55,.3),
+    0 0 100px rgba(212,175,55,.15),
+    inset 0 1px 0 rgba(255,255,200,.5);
+  animation:frameGlow 3s ease-in-out infinite;
+}
+@keyframes frameGlow{
+  0%,100%{box-shadow:0 0 0 2px #2a1100,0 0 30px rgba(212,175,55,.6),0 0 60px rgba(212,175,55,.3),0 0 100px rgba(212,175,55,.15),inset 0 1px 0 rgba(255,255,200,.5)}
+  50%{box-shadow:0 0 0 2px #2a1100,0 0 50px rgba(255,229,102,.9),0 0 90px rgba(212,175,55,.5),0 0 140px rgba(212,175,55,.25),inset 0 1px 0 rgba(255,255,200,.8)}
+}
+
+.bezel {
+  flex:1;min-height:0;display:flex;flex-direction:column;
+  background:#020100;
+  border-radius:9px;
+  border:2px solid #1a0800;
+  /* deep inset shadows — makes symbols "glow FROM within" */
+  box-shadow:
+    inset 0 0 120px rgba(0,0,0,1),
+    inset 0 0 60px rgba(0,0,0,.9),
+    inset 0 30px 50px rgba(0,0,0,.8),
+    inset 0 -30px 50px rgba(0,0,0,.8);
+  position:relative;overflow:hidden;
+  padding:clamp(4px,.5vh,8px);
+}
+/* CRT glass glare */
+.bezel::before {
+  content:'';position:absolute;top:0;left:0;right:0;height:40%;
+  background:linear-gradient(180deg,rgba(255,255,255,.04) 0%,transparent 100%);
+  pointer-events:none;z-index:20;border-radius:7px 7px 0 0;
+}
+/* subtle scanlines */
+.bezel::after {
+  content:'';position:absolute;inset:0;
+  background:repeating-linear-gradient(0deg,transparent 0,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 3px);
+  pointer-events:none;z-index:21;border-radius:7px;
+}
+
+/* ═══════════════════════════════════════
+   REELS ROW
+═══════════════════════════════════════ */
+.reels-row {
+  display:flex;flex-direction:row;gap:6px;
+  flex:1;min-height:0;width:100%;
+  position:relative;z-index:2;
+}
+/* center payline highlight */
+.payline-mid {
+  position:absolute;left:-4px;right:-4px;
+  pointer-events:none;z-index:15;
+  top:calc(100% / 3);height:calc(100% / 3);
+  border-top:2px solid rgba(212,175,55,.5);
+  border-bottom:2px solid rgba(212,175,55,.5);
+}
+.payline-mid::before {
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(180deg,rgba(212,175,55,.07) 0%,rgba(212,175,55,.04) 50%,rgba(212,175,55,.07) 100%);
+}
+.payline-mid::after {
+  content:'◆';position:absolute;
+  left:-18px;top:50%;transform:translateY(-50%);
+  color:rgba(212,175,55,.7);font-size:.7rem;
+  text-shadow:0 0 10px var(--gold),0 0 20px var(--gold);
+  animation:paylinePulse 2s ease-in-out infinite;
+}
+@keyframes paylinePulse{0%,100%{opacity:.6}50%{opacity:1}}
+
+/* ═══════════════════════════════════════
+   INDIVIDUAL REEL — dark with edge glow
+═══════════════════════════════════════ */
+.reel {
+  flex:1;min-height:0;display:flex;flex-direction:column;
+  height:100%;
+  /* dark interior, lit edges = symbols pop */
+  background:linear-gradient(to right,
+    rgba(30,15,0,.9) 0%,
+    rgba(12,5,0,.95) 15%,
+    rgba(8,3,0,.98) 50%,
+    rgba(12,5,0,.95) 85%,
+    rgba(30,15,0,.9) 100%);
+  border-radius:5px;
+  border:1px solid rgba(80,40,0,.8);
+  box-shadow:
+    inset 3px 0 10px rgba(0,0,0,.9),
+    inset -3px 0 10px rgba(0,0,0,.9),
+    inset 0 10px 24px rgba(0,0,0,.95),
+    inset 0 -10px 24px rgba(0,0,0,.95),
+    0 0 8px rgba(212,175,55,.15);
+  position:relative;overflow:hidden;
+  transition:box-shadow .3s,background .3s;
+}
+/* top/bottom fade masks on reel */
+.reel::before {
+  content:'';position:absolute;top:0;left:0;right:0;height:28%;
+  background:linear-gradient(180deg,rgba(0,0,0,.7) 0%,transparent 100%);
+  pointer-events:none;z-index:4;
+}
+.reel::after {
+  content:'';position:absolute;bottom:0;left:0;right:0;height:28%;
+  background:linear-gradient(0deg,rgba(0,0,0,.7) 0%,transparent 100%);
+  pointer-events:none;z-index:4;
+}
+.reel.anticipation {
+  background:linear-gradient(to right,rgba(60,10,0,.9),rgba(25,3,0,.97),rgba(60,10,0,.9));
+  box-shadow:inset 0 0 40px rgba(255,30,0,.4),0 0 30px rgba(255,50,0,.6),inset 0 0 80px rgba(255,30,0,.2);
+  border-color:rgba(255,80,0,.5);
+  animation:beatR .5s infinite;
+}
+.reel.locked-wild {
+  background:linear-gradient(180deg,rgba(255,140,0,.25),rgba(207,53,46,.25));
+  border-color:rgba(255,107,0,.6);
+  box-shadow:0 0 50px var(--fire),inset 0 0 40px rgba(255,150,0,.25);
+  animation:fireR 1.5s infinite alternate;
+}
+.reel.wild-expand-burst { animation:wBurst .6s ease-out; }
+@keyframes beatR  {0%{filter:brightness(1)}50%{filter:brightness(1.8)}100%{filter:brightness(1)}}
+@keyframes fireR  {0%{filter:brightness(1)}100%{filter:brightness(1.5)}}
+@keyframes wBurst {
+  0%  {box-shadow:0 0 10px var(--fire);}
+  40% {box-shadow:0 0 120px var(--fire),inset 0 0 100px rgba(255,255,200,.5);filter:brightness(2.5);}
+  100%{box-shadow:0 0 10px var(--fire);}
+}
+
+/* ═══════════════════════════════════════
+   SYMBOL BOXES & CELLS
+═══════════════════════════════════════ */
+.sym-box {
+  width:100%;flex:1;min-height:0;
+  display:flex;align-items:center;justify-content:center;
+  position:relative;overflow:hidden;
+  border-bottom:1px solid rgba(80,40,0,.6);
+}
+.sym-box:last-child{border-bottom:none;}
+/* center row highlight strip */
+.reel .sym-box:nth-child(2) {
+  background:rgba(255,220,100,.025);
+  border-top:1px solid rgba(212,175,55,.12);
+  border-bottom:1px solid rgba(212,175,55,.12);
+}
+
+.sym-cnt {
+  position:absolute;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  will-change:transform;
+  filter:drop-shadow(0 0 8px rgba(255,200,80,.25)) drop-shadow(0 4px 10px rgba(0,0,0,.9));
+  z-index:2;
+  padding:6%;
+}
+/* SVG fills the cell — fills entire sym-box */
+.sym-cnt svg {
+  width:100%;height:100%;
+  max-width:none;max-height:none;
+  overflow:visible;
+}
+
+/* special symbol states */
+.sym-cnt.wild-symbol {
+  filter:drop-shadow(0 0 22px var(--fire)) drop-shadow(0 0 50px var(--hades)) drop-shadow(0 4px 10px rgba(0,0,0,.9));
+  animation:wBurn .7s infinite alternate;
+  padding:4%;
+}
+.sym-cnt.static-wild {
+  filter:drop-shadow(0 0 14px rgba(255,107,0,.9)) drop-shadow(0 4px 10px rgba(0,0,0,.8));
+}
+.sym-cnt.obol-symbol {
+  filter:drop-shadow(0 0 18px #ffea00) drop-shadow(0 0 35px #ffd700);
+  animation:cGlow 1.5s infinite alternate;
+}
+.sym-cnt.scatter-glow {
+  filter:drop-shadow(0 0 18px #00f3ff) drop-shadow(0 0 35px #00f3ff);
+  animation:scatterPulse .8s infinite alternate;
+}
+@keyframes wBurn {0%{transform:scale(1)}100%{transform:scale(1.1);filter:drop-shadow(0 0 30px var(--fire)) drop-shadow(0 0 60px var(--hades))}}
+@keyframes cGlow {0%{filter:drop-shadow(0 0 10px #ffea00)}100%{filter:drop-shadow(0 0 28px #ffea00) drop-shadow(0 0 50px #ffd700)}}
+@keyframes scatterPulse{0%{transform:scale(1)}100%{transform:scale(1.18);filter:drop-shadow(0 0 24px #00f3ff) drop-shadow(0 0 45px #00f3ff)}}
+
+/* WIN GLOW on symbol */
+.sym-cnt.win-glow {
+  animation:winGlowAnim .6s ease-out forwards;
+}
+@keyframes winGlowAnim{
+  0%{filter:drop-shadow(0 0 30px var(--gold-glow)) drop-shadow(0 0 60px var(--gold)) brightness(2.2) scale(1.15);}
+  100%{filter:drop-shadow(0 0 8px rgba(255,200,80,.4)) brightness(1) scale(1);}
+}
+
+.coin-val {
+  position:absolute;bottom:6px;
+  font-family:'Cinzel',serif;font-size:.9rem;font-weight:900;
+  color:#fff;text-shadow:0 0 6px #000,0 2px 0 #000,0 0 18px var(--gold);
+  z-index:10;letter-spacing:1px;
+}
+
+/* ── SPIN ANIMATIONS ── */
+.spinning    {animation:rScroll .09s infinite linear;filter:blur(4px)!important;opacity:.55;}
+.slide-down  {animation:slideD .32s cubic-bezier(.25,1,.5,1) forwards;z-index:5;}
+.heavy-stop  {animation:bounceStop .35s cubic-bezier(.36,.07,.19,.97);}
+.win-flash   {animation:gFlash .8s ease-out;z-index:10;}
+.win-flash-static {background:rgba(212,175,55,.4);border-radius:4px;box-shadow:0 0 35px var(--gold),inset 0 0 20px rgba(255,229,102,.2);}
+.scatter-pulse   {animation:sPulse .45s infinite alternate;}
+.roll-back   {animation:tumble .8s cubic-bezier(.55,.085,.68,.53) forwards;}
+
+@keyframes rScroll  {0%{transform:translateY(-130%)}100%{transform:translateY(130%)}}
+@keyframes slideD   {0%{transform:translateY(0)}100%{transform:translateY(140px)}}
+@keyframes bounceStop{0%{transform:translateY(-18px)}55%{transform:translateY(7px)}75%{transform:translateY(-4px)}100%{transform:translateY(0)}}
+@keyframes gFlash   {0%{background:rgba(255,230,100,.9);box-shadow:0 0 60px var(--gold),inset 0 0 30px rgba(255,230,100,.5);transform:scale(1.06);border-radius:5px}100%{background:transparent;box-shadow:none;transform:scale(1);border-radius:0}}
+@keyframes sPulse   {0%{filter:drop-shadow(0 0 8px #00f3ff);transform:scale(1)}100%{filter:drop-shadow(0 0 28px #00f3ff) drop-shadow(0 0 55px #00f3ff);transform:scale(1.28)}}
+@keyframes tumble   {0%{transform:translateY(0) rotate(0);opacity:1}100%{transform:translateY(260px) rotate(200deg);opacity:0}}
+
+/* ═══════════════════════════════════════
+   LIGHTNING EFFECT (Zeus bonus)
+═══════════════════════════════════════ */
+.lightning-overlay {
+  position:fixed;inset:0;z-index:500;pointer-events:none;
+  background:rgba(200,240,255,.0);
+  opacity:0;
+}
+.lightning-overlay.strike {
+  animation:lightningStrike .4s ease-out forwards;
+}
+@keyframes lightningStrike{
+  0%{opacity:0;background:rgba(200,240,255,0)}
+  10%{opacity:1;background:rgba(200,240,255,.35)}
+  20%{opacity:.3}
+  35%{opacity:.9;background:rgba(180,230,255,.25)}
+  50%{opacity:.1}
+  70%{opacity:.7;background:rgba(200,240,255,.15)}
+  100%{opacity:0}
+}
+/* SVG lightning bolt */
+.lightning-bolt {
+  position:fixed;pointer-events:none;z-index:501;
+  width:80px;opacity:0;
+  filter:drop-shadow(0 0 12px #00d4ff) drop-shadow(0 0 30px #fff);
+}
+.lightning-bolt.animate {
+  animation:boltFall .5s ease-in forwards;
+}
+@keyframes boltFall{0%{opacity:0;transform:translateY(-80px) scale(.5)}30%{opacity:1;transform:translateY(0) scale(1)}70%{opacity:.8}100%{opacity:0;transform:translateY(40px) scale(.8)}}
+
+/* ═══════════════════════════════════════
+   STATUS PANEL — solid wood
+═══════════════════════════════════════ */
+.status-panel {
+  position:relative;z-index:1;
+  background:linear-gradient(180deg,#a05010 0%,#7a3408 60%,#5c2600 100%);
+  border-radius:0 0 11px 11px;
+  border-top:3px solid #1a0a00;
+  padding:5px 20px 6px;flex-shrink:0;
+  text-align:center;
+  box-shadow:inset 0 2px 0 rgba(255,190,60,.35),inset 0 -1px 0 rgba(0,0,0,.5);
+}
+.status-panel::before,.status-panel::after {
+  content:'✦';position:absolute;top:50%;transform:translateY(-50%);
+  color:rgba(255,200,80,.5);font-size:.85rem;
+  text-shadow:0 0 8px var(--gold);
+}
+.status-panel::before{left:20px;} .status-panel::after{right:20px;}
+.fs-bar {
+  display:none;
+  background:rgba(0,0,0,.4);border-radius:4px;
+  padding:3px 14px;margin-bottom:5px;
+  font-size:clamp(.7rem,1vw,.85rem);font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  color:var(--gold-glow);text-shadow:0 0 14px rgba(255,229,102,.8);
+  border:1px solid rgba(212,175,55,.35);
+  animation:fsPulse 1s infinite alternate;
+}
+@keyframes fsPulse{0%{text-shadow:0 0 8px rgba(255,229,102,.6)}100%{text-shadow:0 0 20px rgba(255,229,102,.9),0 0 40px rgba(212,175,55,.5)}}
+.status-msg {
+  font-size:clamp(.7rem,1.3vw,1.05rem);font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  color:#ffe8a0;min-height:1.4em;line-height:1.3;
+  text-shadow:0 2px 0 rgba(0,0,0,.7),0 0 10px rgba(255,200,80,.3);
+}
+.status-footer {
+  display:flex;justify-content:space-between;margin-top:5px;
+  font-size:clamp(.55rem,.75vw,.68rem);letter-spacing:1px;color:rgba(255,200,80,.45);
+  text-transform:uppercase;font-weight:600;
+}
+.kbd {
+  display:inline-block;background:rgba(0,0,0,.35);
+  border:1px solid rgba(255,180,60,.3);border-radius:3px;
+  padding:1px 5px;font-family:monospace;color:rgba(255,200,100,.75);font-size:.63rem;
+}
+
+/* ═══════════════════════════════════════
+   FLOATING WIN TEXT
+═══════════════════════════════════════ */
+.float-win {
+  position:fixed;
+  font-family:'Cinzel Decorative',cursive;
+  font-weight:900;
+  color:#fff;
+  text-shadow:0 0 20px var(--gold),0 0 40px var(--gold),0 3px 0 rgba(0,0,0,.8);
+  pointer-events:none;z-index:600;
+  white-space:nowrap;
+  animation:floatUp 1.4s ease-out forwards;
+}
+@keyframes floatUp{
+  0%{transform:translateY(0) scale(.8);opacity:0}
+  15%{transform:translateY(-10px) scale(1.1);opacity:1}
+  70%{transform:translateY(-60px) scale(1);opacity:1}
+  100%{transform:translateY(-100px) scale(.9);opacity:0}
+}
+
+/* ═══════════════════════════════════════
+   BIG WIN OVERLAY
+═══════════════════════════════════════ */
+.bw-overlay {
+  position:absolute;top:50%;left:50%;z-index:200;
+  transform:translate(-50%,-50%) scale(0);
+  opacity:0;z-index:200;pointer-events:none;
+  background:linear-gradient(150deg,rgba(6,2,0,.97) 0%,rgba(20,7,0,.98) 100%);
+  padding:clamp(24px,4vh,40px) clamp(30px,5vw,55px);
+  border-radius:20px;
+  border:2px solid var(--gold);
+  box-shadow:0 0 0 5px rgba(212,175,55,.1),0 0 100px rgba(212,175,55,.3),0 50px 120px rgba(0,0,0,.95);
+  min-width:300px;text-align:center;
+  transition:all .25s cubic-bezier(.175,.885,.32,1.4);
+}
+.bw-overlay::before {
+  content:'';position:absolute;inset:8px;border-radius:13px;
+  border:1px solid rgba(212,175,55,.15);pointer-events:none;
+}
+.bw-overlay.show {transform:translate(-50%,-50%) scale(1);opacity:1;pointer-events:auto;}
+.bw-lbl {
+  font-family:'Cinzel Decorative',cursive;
+  font-size:clamp(1.8rem,4vw,2.8rem);font-weight:900;color:var(--gold);
+  text-shadow:0 0 24px currentColor,0 0 55px currentColor;
+  margin:0;line-height:1;
+  animation:bwP .5s infinite alternate;transition:color .3s;
+}
+.bw-amt {
+  font-family:'Cinzel',serif;font-size:clamp(2rem,4.5vw,3.4rem);font-weight:900;
+  color:#fff;margin-top:6px;transition:color .3s;
+  text-shadow:0 4px 24px rgba(0,0,0,.8);
+}
+.inferno-txt {
+  font-family:'Cinzel Decorative',cursive;font-size:clamp(1.6rem,3.5vw,2.6rem);
+  color:#fff;text-shadow:0 0 24px #ffea00,0 0 55px #ff6b00,0 0 100px var(--hades);
+  animation:bwP .18s infinite alternate;
+}
+@keyframes bwP{0%{transform:scale(1)}100%{transform:scale(1.06)}}
+.retrigger-msg{color:#00f3ff;text-shadow:0 0 14px #00f3ff;font-size:1.1rem;font-weight:bold;letter-spacing:2px;}
+.sisy-track {
+  position:relative;width:80%;height:42px;margin:clamp(12px,2vh,22px) auto 0;
+  border-bottom:2px solid rgba(212,175,55,.35);
+  transform:rotate(-3deg);overflow:visible;
+}
+.sisy-push {position:absolute;bottom:-5px;left:0%;display:flex;align-items:flex-end;transition:left .1s linear;}
+.sisy-man  {font-size:2rem;display:inline-block;transform-origin:bottom center;animation:struggle 1s alternate infinite;}
+.sisy-rock {font-size:2.4rem;display:inline-block;margin-left:-11px;z-index:2;animation:rockRoll 1s linear infinite;}
+@keyframes struggle{0%{transform:scaleX(-1) rotate(-14deg) skewX(4deg)}100%{transform:scaleX(-1) rotate(-36deg) skewX(14deg) translateX(-5px)}}
+@keyframes rockRoll{100%{transform:rotate(360deg)}}
+
+/* ═══════════════════════════════════════
+   PARTICLES & COINS
+═══════════════════════════════════════ */
+.particle {
+  position:fixed;border-radius:50%;pointer-events:none;z-index:900;
+  animation:pFly .8s forwards cubic-bezier(0,1,.5,1);
+}
+@keyframes pFly{0%{transform:translate(0,0) scale(1);opacity:1}100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}}
+.coin {
+  position:fixed;width:26px;height:26px;
+  background:radial-gradient(circle at 35% 35%,#ffe566,#d4af37 60%,#8a6a10);
+  border-radius:50%;border:2px solid #ffcc00;
+  box-shadow:0 3px 10px rgba(0,0,0,.6),0 0 8px rgba(255,220,0,.5);
+  pointer-events:none;z-index:800;animation:cFall 2s linear forwards;
+}
+.coin::after{content:'';}
+@keyframes cFall{0%{transform:translateY(-60px) rotate(0);opacity:1}100%{transform:translateY(110vh) rotate(720deg);opacity:0}}
+.flying-obol {
+  position:fixed;font-size:1.6rem;z-index:950;
+  transition:all .55s cubic-bezier(.25,1,.5,1);
+  pointer-events:none;filter:drop-shadow(0 0 14px #ffea00);
+}
+
+/* ═══════════════════════════════════════
+   MQTT
+═══════════════════════════════════════ */
+.mqtt-hud {
+  position:fixed;top:14px;right:16px;
+  font-family:monospace;font-size:.7rem;font-weight:bold;
+  background:rgba(0,0,0,.82);backdrop-filter:blur(10px);
+  padding:4px 12px;border-radius:5px;
+  border:1px solid #444;color:#555;z-index:300;
+  transition:all .3s;letter-spacing:1px;
+}
+.mqtt-hud.connected    {color:var(--zeus);border-color:rgba(0,212,255,.5);text-shadow:0 0 8px var(--zeus);}
+.mqtt-hud.disconnected {color:#ff4444;border-color:rgba(255,68,68,.5);text-shadow:0 0 8px #ff4444;}
+
+/* ═══════════════════════════════════════
+   SHOP OVERLAY
+═══════════════════════════════════════ */
+#shop-overlay {
+  position:fixed;inset:0;z-index:1000;
+  display:none;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.88);
+  backdrop-filter:blur(6px);
+  animation:shopFadeIn .25s ease-out;
+}
+#shop-overlay.open { display:flex; }
+@keyframes shopFadeIn{0%{opacity:0;transform:scale(.96)}100%{opacity:1;transform:scale(1)}}
+
+.shop-panel {
+  position:relative;
+  width:min(720px,96vw);
+  background:linear-gradient(160deg,#12070a 0%,#1c0a00 50%,#0a0a1a 100%);
+  border:2px solid var(--gold);
+  border-radius:18px;
+  padding:clamp(20px,3vh,36px) clamp(18px,3vw,36px);
+  box-shadow:0 0 0 4px rgba(212,175,55,.12),0 0 80px rgba(212,175,55,.25),0 40px 100px rgba(0,0,0,.95);
+  max-height:90vh;overflow-y:auto;
+}
+.shop-panel::before {
+  content:'';position:absolute;inset:6px;border-radius:12px;
+  border:1px solid rgba(212,175,55,.12);pointer-events:none;
+}
+
+.shop-title {
+  font-family:'Cinzel Decorative',cursive;
+  font-size:clamp(1.2rem,2.8vw,2rem);font-weight:900;
+  color:var(--gold-glow);letter-spacing:3px;text-align:center;
+  text-shadow:0 0 24px var(--gold),0 0 50px rgba(212,175,55,.4);
+  margin-bottom:4px;
+}
+.shop-subtitle {
+  font-family:'IM Fell English',serif;font-style:italic;
+  font-size:.85rem;color:rgba(200,165,80,.55);text-align:center;letter-spacing:1px;
+  margin-bottom:18px;
+}
+.shop-balance {
+  text-align:center;margin-bottom:20px;
+  font-family:'Cinzel',serif;font-size:.95rem;font-weight:700;
+  color:rgba(255,255,255,.7);letter-spacing:1px;
+}
+.shop-balance span {
+  color:var(--gold-glow);font-size:1.2rem;font-weight:900;
+  text-shadow:0 0 12px var(--gold);
+}
+
+.shop-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+  gap:12px;
+  margin-bottom:22px;
+}
+
+.shop-item {
+  background:linear-gradient(160deg,rgba(40,20,0,.7),rgba(10,8,20,.8));
+  border:1.5px solid rgba(212,175,55,.25);
+  border-radius:12px;padding:16px 14px;
+  display:flex;flex-direction:column;align-items:center;gap:8px;
+  cursor:pointer;transition:all .22s;
+  position:relative;overflow:hidden;
+}
+.shop-item:hover:not(.maxed):not(.cant-afford) {
+  border-color:var(--gold);
+  box-shadow:0 0 22px rgba(212,175,55,.35),inset 0 0 14px rgba(212,175,55,.06);
+  transform:translateY(-2px);
+}
+.shop-item::before {
+  content:'';position:absolute;top:0;left:-60%;width:40%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
+  transition:left .4s;
+}
+.shop-item:hover::before { left:160%; }
+
+.shop-item.maxed {
+  border-color:rgba(0,212,255,.4);
+  background:linear-gradient(160deg,rgba(0,30,50,.7),rgba(0,20,40,.8));
+  cursor:default;
+}
+.shop-item.cant-afford {
+  opacity:.45;cursor:not-allowed;filter:grayscale(.4);
+}
+
+.shop-item-icon { font-size:2.2rem;line-height:1; }
+.shop-item-name {
+  font-family:'Cinzel',serif;font-size:.78rem;font-weight:700;
+  color:var(--gold-glow);letter-spacing:1px;text-align:center;text-transform:uppercase;
+}
+.shop-item-desc {
+  font-size:.7rem;color:rgba(255,220,160,.55);text-align:center;
+  line-height:1.45;min-height:36px;
+}
+.shop-item-level {
+  display:flex;gap:4px;margin:2px 0;
+}
+.shop-item-level .dot {
+  width:10px;height:10px;border-radius:50%;
+  background:rgba(255,255,255,.15);border:1.5px solid rgba(212,175,55,.3);
+  transition:all .2s;
+}
+.shop-item-level .dot.filled {
+  background:var(--gold);border-color:var(--gold-glow);
+  box-shadow:0 0 6px var(--gold);
+}
+.shop-item-price {
+  font-family:'Cinzel',serif;font-size:.82rem;font-weight:900;
+  color:#fff;background:rgba(0,0,0,.4);
+  padding:3px 10px;border-radius:6px;
+  border:1px solid rgba(212,175,55,.25);
+}
+.shop-item-price.maxed-lbl {
+  color:var(--zeus);border-color:rgba(0,212,255,.3);
+  text-shadow:0 0 8px var(--zeus);
+}
+
+/* active effect badge */
+.shop-item .active-badge {
+  position:absolute;top:7px;right:8px;
+  font-size:.6rem;font-weight:900;letter-spacing:1px;
+  color:#0f0;text-shadow:0 0 6px #0f0;
+  text-transform:uppercase;
+}
+
+.shop-close-btn {
+  display:block;margin:0 auto;
+  background:linear-gradient(180deg,#a05010,#7a3408);
+  border:1.5px solid rgba(212,175,55,.5);border-radius:8px;
+  padding:9px 36px;cursor:pointer;
+  font-family:'Cinzel',serif;font-size:.9rem;font-weight:700;
+  color:#ffe8a0;letter-spacing:2px;text-transform:uppercase;
+  transition:all .2s;
+  box-shadow:0 4px 18px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,200,80,.3);
+}
+.shop-close-btn:hover {
+  background:linear-gradient(180deg,#c87020,#a05010);
+  box-shadow:0 6px 24px rgba(0,0,0,.7),0 0 16px rgba(212,175,55,.3),inset 0 1px 0 rgba(255,200,80,.4);
+  transform:translateY(-1px);
+}
+
+/* shop notification flash in HUD */
+.shop-hint {
+  font-size:.62rem;color:rgba(212,175,55,.5);letter-spacing:1px;
+  animation:shopHintPulse 2s ease-in-out infinite;
+}
+@keyframes shopHintPulse{0%,100%{opacity:.5}50%{opacity:1;color:var(--gold)}}
+
+/* purchase flash feedback */
+.purchase-flash {
+  animation:pFlash .45s ease-out forwards;
+}
+@keyframes pFlash{0%{background:rgba(212,175,55,.35)}100%{background:transparent}}
+
+</style>
+</head>
+<body>
+
+<div class="mqtt-hud disconnected" id="mqtt-status">MQTT: DISCONNECTED</div>
+<div class="lightning-overlay" id="lightning-overlay"></div>
+
+<div id="shell">
+
+  <!-- JACKPOT METERS -->
+  <div class="jp-strip">
+    <div class="jp-box jp-mega">
+      <span class="jp-icon">⚡</span>
+      <span class="jp-lbl">MEGA JACKPOT</span>
+      <span class="jp-val" id="mega-val">10,000</span>
+    </div>
+    <div class="jp-box jp-major">
+      <span class="jp-icon">★</span>
+      <span class="jp-lbl">MAJOR JACKPOT</span>
+      <span class="jp-val" id="major-val">1,000</span>
+    </div>
+    <div class="jp-box jp-minor">
+      <span class="jp-icon">✦</span>
+      <span class="jp-lbl">MINOR JACKPOT</span>
+      <span class="jp-val" id="minor-val">200</span>
+    </div>
+  </div>
+
+  <!-- HUD -->
+  <div class="hud">
+    <div class="hc">
+      <span class="hc-icon">◈</span>Balance
+      <span class="hv" id="credits-display">1000</span>
+    </div>
+    <div class="hc">
+      <span class="hc-icon">◆</span>Bet
+      <span class="hv" id="bet-display">10</span>
+    </div>
+    <div class="hc">
+      <span class="hc-icon">★</span>Win
+      <span class="hv" id="win-display">0</span>
+    </div>
+    <div class="hc obol">
+      <span class="hc-icon">Ω</span>Obols
+      <span class="hv"><span id="obol-display">0</span>/3</span>
+    </div>
+    <div class="hc">
+      <span class="hc-icon">⚙</span>Spins
+      <span class="hv" id="attempts">0</span>
+    </div>
+  </div>
+
+  <!-- TITLE -->
+  <div class="title-wrap">
+    <div class="title-orn">
+      <span class="orn-bar"></span>
+      <span class="orn-sym">⚡</span><span class="orn-sym">✦</span><span class="orn-sym">⚡</span>
+      <span class="orn-bar"></span>
+    </div>
+    <h1>GREEK SLOT</h1>
+    <p class="subtitle">"The gods play dice with the universe"</p>
+  </div>
+
+  <!-- CABINET -->
+  <div class="cabinet">
+    <div class="cab-head">
+      <div class="cab-head-title">DIVINE MISFORTUNE</div>
+      <div class="head-ornaments">⚔ &nbsp;Ω&nbsp; ✦ &nbsp;⚡&nbsp; Ω &nbsp;⚔</div>
+    </div>
+
+    <div class="cab-body">
+      <!-- GOLDEN FRAME wraps bezel -->
+      <div class="reel-frame">
+        <div class="bezel">
+
+          <!-- BIG WIN OVERLAY -->
+          <div class="bw-overlay" id="big-win-overlay">
+            <div class="bw-lbl" id="big-win-text">BIG WIN!</div>
+            <div class="bw-amt" id="big-win-amount">0</div>
+            <div class="sisy-track">
+              <div class="sisy-push" id="sisyphus-pusher">
+                <span class="sisy-man" id="sisyphus-man">🏃</span>
+                <span class="sisy-rock" id="sisyphus-boulder">🪨</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- REELS -->
+          <div class="reels-row" id="slot-grid">
+            <div class="payline-mid"></div>
+          </div>
+
+        </div><!-- /bezel -->
+      </div><!-- /reel-frame -->
+
+      <!-- STATUS -->
+      <div class="status-panel">
+        <div class="fs-bar" id="free-spins-display">⚡ ZEUS WRATH: <span id="free-spins">0</span> SPINS LEFT ⚡</div>
+        <div class="status-msg" id="message">Waiting for the lever</div>
+        <div class="status-footer">
+          <span>PRESS <span class="kbd">SPACE</span> TO SPIN</span>
+          <span>MQTT: "pull"</span>
+          <span>CLICK ONCE FOR AUDIO</span>
+        </div>
+      </div>
+    </div><!-- /cab-body -->
+  </div><!-- /cabinet -->
+
+</div><!-- /shell -->
+
+<script>
+/* ══════════════════════════════════════════
+   STATE MACHINE
+══════════════════════════════════════════ */
+const S_IDLE=0,S_SPIN=1,S_STOP=2,S_EVAL=3,
+      S_LINES=4,S_ROLLUP=5,S_TRANS=6,S_JP_SPIN=7,S_JP_STOP=8;
+let gs=S_IDLE;
+
+/* ══════════════════════════════════════════
+   ECONOMY
+══════════════════════════════════════════ */
+let souls=1000,bet=10,attempts=0,freeSpins=0;
+let inBonus=false,infernoPlayed=false,isWildRespin=false;
+let fallingWilds=[],activeWildsNow=[];
+let stickyReels=[false,false,false,false,false];
+let reelStopped=[false,false,false,false,false];
+let obolsCollected=0,jackpotSpins=0,jackpotGrid,jpTotal=0,jpEmpty=[];
+let tickInterval,visualInterval,stopTimeouts=[];
+let evalTid,winTid,rafId,finishTid,transTid,activeWinData=null;
+
+/* ══════════════════════════════════════════
+   SVG SYMBOL LIBRARY — premium illustrated
+══════════════════════════════════════════ */
+const SYMS = {
+  // ── TEMPLE ── rich marble architecture, gold & ivory
+  'temple': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="tStone" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fff8e0"/><stop offset="40%" stop-color="#ffe8a0"/><stop offset="80%" stop-color="#d4a830"/><stop offset="100%" stop-color="#8a6010"/></linearGradient>
+      <linearGradient id="tShad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="rgba(0,0,0,.4)"/><stop offset="30%" stop-color="rgba(0,0,0,0)"/></linearGradient>
+      <linearGradient id="tSky" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0a1a40"/><stop offset="100%" stop-color="#1a3060"/></linearGradient>
+      <radialGradient id="tGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,220,80,.3)"/><stop offset="100%" stop-color="rgba(255,220,80,0)"/></radialGradient>
+      <filter id="tF"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      <filter id="tGlowF"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#tGlowF)">
+    <!-- sky backdrop -->
+    <rect x="0" y="0" width="120" height="120" rx="8" fill="url(#tSky)" opacity=".5"/>
+    <!-- glow halo -->
+    <ellipse cx="60" cy="60" rx="55" ry="55" fill="url(#tGlow)"/>
+    <!-- top steps -->
+    <rect x="4" y="100" width="112" height="10" rx="3" fill="url(#tStone)" stroke="#7a5800" stroke-width="1.5"/>
+    <rect x="9" y="93" width="102" height="8" rx="2" fill="url(#tStone)" stroke="#8a6800" stroke-width="1"/>
+    <rect x="14" y="87" width="92" height="7" rx="2" fill="url(#tStone)" stroke="#9a7000" stroke-width="1"/>
+    <!-- shadow on steps -->
+    <rect x="4" y="100" width="30" height="10" rx="3" fill="url(#tShad)" opacity=".5"/>
+    <!-- columns -->
+    <rect x="17" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="32" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="47" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="62" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="77" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="92" y="42" width="10" height="46" rx="3" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <!-- column fluting lines -->
+    <line x1="20" y1="42" x2="20" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <line x1="35" y1="42" x2="35" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <line x1="50" y1="42" x2="50" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <line x1="65" y1="42" x2="65" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <line x1="80" y1="42" x2="80" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <line x1="95" y1="42" x2="95" y2="88" stroke="rgba(0,0,0,.15)" stroke-width=".8"/>
+    <!-- column capitals -->
+    <rect x="14" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="29" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="44" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="59" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="74" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <rect x="89" y="38" width="16" height="5" rx="1" fill="url(#tStone)" stroke="#c09020" stroke-width="1"/>
+    <!-- entablature -->
+    <rect x="10" y="32" width="100" height="7" rx="1" fill="url(#tStone)" stroke="#8a6800" stroke-width="1.5"/>
+    <!-- pediment -->
+    <polygon points="60,8 8,32 112,32" fill="url(#tStone)" stroke="#8a6000" stroke-width="2"/>
+    <!-- pediment inner triangle highlight -->
+    <polygon points="60,14 18,30 102,30" fill="rgba(255,255,160,.15)"/>
+    <!-- pediment statue silhouette -->
+    <ellipse cx="60" cy="24" rx="5" ry="7" fill="rgba(200,160,40,.6)"/>
+    <!-- acroteria (tip ornaments) -->
+    <polygon points="60,6 57,12 63,12" fill="#d4af37" stroke="#8a6000" stroke-width="1"/>
+    <polygon points="8,30 5,36 11,36" fill="#d4af37" stroke="#8a6000" stroke-width="1"/>
+    <polygon points="112,30 109,36 115,36" fill="#d4af37" stroke="#8a6000" stroke-width="1"/>
+    <!-- inner darkness (doorway) -->
+    <rect x="48" y="56" width="24" height="32" rx="2" fill="rgba(0,0,0,.7)"/>
+    <rect x="50" y="54" width="20" height="4" rx="1" fill="url(#tStone)" stroke="#8a6000" stroke-width="1"/>
+    </g>
+  </svg>`,
+
+  // ── AMPHORA ── detailed terracotta with meander & figures
+  'amphora': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="aBody" cx="35%" cy="35%" r="65%"><stop offset="0%" stop-color="#f07040"/><stop offset="35%" stop-color="#d05020"/><stop offset="70%" stop-color="#a03010"/><stop offset="100%" stop-color="#601808"/></radialGradient>
+      <linearGradient id="aShine" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="rgba(255,200,140,.55)"/><stop offset="100%" stop-color="rgba(255,200,140,0)"/></linearGradient>
+      <linearGradient id="aNeck" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#e06030"/><stop offset="100%" stop-color="#903010"/></linearGradient>
+      <filter id="aF"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#aF)">
+    <!-- neck -->
+    <path d="M46,14 Q40,20 38,34 L82,34 Q80,20 74,14 Z" fill="url(#aNeck)" stroke="#601808" stroke-width="1.5"/>
+    <!-- rim -->
+    <ellipse cx="60" cy="14" rx="15" ry="6" fill="url(#aNeck)" stroke="#903010" stroke-width="2"/>
+    <ellipse cx="60" cy="14" rx="10" ry="3" fill="rgba(0,0,0,.5)"/>
+    <!-- body -->
+    <path d="M38,34 Q16,52 18,78 Q22,100 60,108 Q98,100 102,78 Q104,52 82,34 Z" fill="url(#aBody)" stroke="#601808" stroke-width="2"/>
+    <!-- shine overlay -->
+    <path d="M38,34 Q22,52 24,78" fill="none" stroke="url(#aShine)" stroke-width="10" stroke-linecap="round"/>
+    <!-- handles -->
+    <path d="M38,44 Q22,46 20,62 Q20,76 38,80" fill="none" stroke="#903010" stroke-width="5.5" stroke-linecap="round"/>
+    <path d="M82,44 Q98,46 100,62 Q100,76 82,80" fill="none" stroke="#903010" stroke-width="5.5" stroke-linecap="round"/>
+    <!-- handle highlight -->
+    <path d="M38,44 Q24,48 22,62" fill="none" stroke="rgba(255,160,80,.4)" stroke-width="2" stroke-linecap="round"/>
+    <!-- meander band top -->
+    <rect x="36" y="58" width="48" height="4" fill="#ffd080" opacity=".6"/>
+    <!-- meander pattern -->
+    <path d="M36,60 L42,60 L42,56 L48,56 L48,64 L54,64 L54,58 L60,58 L60,64 L66,64 L66,56 L72,56 L72,62 L78,62 L78,56 L84,56" fill="none" stroke="#1a0800" stroke-width="1.5" opacity=".8"/>
+    <!-- figure silhouettes on vase -->
+    <ellipse cx="52" cy="80" rx="6" ry="10" fill="rgba(20,0,0,.5)"/>
+    <ellipse cx="68" cy="80" rx="6" ry="10" fill="rgba(20,0,0,.5)"/>
+    <!-- meander band bottom -->
+    <rect x="36" y="90" width="48" height="3" fill="#ffd080" opacity=".5"/>
+    <!-- base ring -->
+    <ellipse cx="60" cy="108" rx="18" ry="6" fill="#601808"/>
+    <ellipse cx="60" cy="108" rx="14" ry="4" fill="#903010"/>
+    </g>
+  </svg>`,
+
+  // ── SHIELD ── Spartan war shield with lambda symbol
+  'shield': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="shMetal" cx="38%" cy="30%" r="70%"><stop offset="0%" stop-color="#8090d8"/><stop offset="40%" stop-color="#4060b8"/><stop offset="80%" stop-color="#1a3080"/><stop offset="100%" stop-color="#080e28"/></radialGradient>
+      <radialGradient id="shBoss" cx="35%" cy="35%" r="60%"><stop offset="0%" stop-color="#e0e8ff"/><stop offset="40%" stop-color="#6080d0"/><stop offset="100%" stop-color="#102050"/></radialGradient>
+      <linearGradient id="shRim" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#c0c8e8"/><stop offset="100%" stop-color="#404880"/></linearGradient>
+      <linearGradient id="shGlare" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="rgba(200,220,255,.6)"/><stop offset="100%" stop-color="rgba(200,220,255,0)"/></linearGradient>
+      <filter id="shF"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#shF)">
+    <!-- outer border -->
+    <path d="M60,6 L104,22 L104,62 Q104,92 60,114 Q16,92 16,62 L16,22 Z" fill="url(#shRim)" stroke="#202860" stroke-width="2"/>
+    <!-- main shield -->
+    <path d="M60,12 L98,26 L98,62 Q98,88 60,108 Q22,88 22,62 L22,26 Z" fill="url(#shMetal)"/>
+    <!-- glare -->
+    <path d="M22,26 Q26,60 22,72" fill="none" stroke="url(#shGlare)" stroke-width="12" stroke-linecap="round"/>
+    <!-- inner border ring -->
+    <path d="M60,20 L90,32 L90,62 Q90,82 60,100 Q30,82 30,62 L30,32 Z" fill="none" stroke="rgba(160,180,255,.3)" stroke-width="1.5"/>
+    <!-- boss/umbo (central rounded dome) -->
+    <circle cx="60" cy="60" r="20" fill="url(#shBoss)" stroke="#c0c8e8" stroke-width="2"/>
+    <circle cx="60" cy="60" r="14" fill="#2040a0" stroke="rgba(160,180,255,.4)" stroke-width="1"/>
+    <!-- Lambda Spartan symbol -->
+    <path d="M52,50 L60,72 L68,50 M56,62 L60,72" stroke="#ffe566" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <!-- boss highlight -->
+    <ellipse cx="54" cy="52" rx="6" ry="4" fill="rgba(200,220,255,.4)" transform="rotate(-20,54,52)"/>
+    <!-- rim bolts -->
+    <circle cx="60" cy="18" r="3.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    <circle cx="60" cy="103" r="3.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    <circle cx="18" cy="60" r="3.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    <circle cx="102" cy="60" r="3.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    <!-- corner bolts -->
+    <circle cx="26" cy="28" r="2.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    <circle cx="94" cy="28" r="2.5" fill="url(#shRim)" stroke="#303870" stroke-width="1"/>
+    </g>
+  </svg>`,
+
+  // ── SWORD ── gleaming Greek xiphos short-sword
+  'sword': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="swBlade" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#d0d8f8"/><stop offset="20%" stop-color="#f0f4ff"/><stop offset="45%" stop-color="#ffffff"/><stop offset="70%" stop-color="#90a0d0"/><stop offset="100%" stop-color="#3050a0"/></linearGradient>
+      <linearGradient id="swGuard" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fff5b0"/><stop offset="40%" stop-color="#d4af37"/><stop offset="100%" stop-color="#6a4400"/></linearGradient>
+      <linearGradient id="swGrip" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#5a2800"/><stop offset="50%" stop-color="#8a4810"/><stop offset="100%" stop-color="#3a1400"/></linearGradient>
+      <radialGradient id="swPommel" cx="40%" cy="35%" r="60%"><stop offset="0%" stop-color="#fff5b0"/><stop offset="50%" stop-color="#d4af37"/><stop offset="100%" stop-color="#6a4400"/></radialGradient>
+      <filter id="swF"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#swF)" transform="rotate(35,60,60)">
+    <!-- blade -->
+    <polygon points="60,8 66,82 60,96 54,82" fill="url(#swBlade)" stroke="#7080c0" stroke-width="1.5"/>
+    <!-- blade fuller (groove) -->
+    <line x1="60" y1="10" x2="60" y2="88" stroke="rgba(255,255,255,.5)" stroke-width="1.5"/>
+    <!-- blade edge gleam -->
+    <polygon points="60,8 63,50 60,50" fill="rgba(255,255,255,.6)"/>
+    <!-- blood groove -->
+    <line x1="58" y1="20" x2="58" y2="75" stroke="rgba(80,100,180,.4)" stroke-width="1"/>
+    <!-- guard -->
+    <rect x="40" y="79" width="40" height="9" rx="4" fill="url(#swGuard)" stroke="#8a6000" stroke-width="1.5"/>
+    <ellipse cx="40" cy="83" rx="5" ry="5" fill="url(#swGuard)" stroke="#8a6000" stroke-width="1.5"/>
+    <ellipse cx="80" cy="83" rx="5" ry="5" fill="url(#swGuard)" stroke="#8a6000" stroke-width="1.5"/>
+    <!-- guard gems -->
+    <circle cx="40" cy="83" r="3" fill="#cc2020"/>
+    <circle cx="80" cy="83" r="3" fill="#2060cc"/>
+    <!-- grip -->
+    <rect x="55" y="87" width="10" height="18" rx="4" fill="url(#swGrip)" stroke="#3a1800" stroke-width="1"/>
+    <!-- grip wrap -->
+    <line x1="55" y1="91" x2="65" y2="91" stroke="#c08040" stroke-width="1.5"/>
+    <line x1="55" y1="95" x2="65" y2="95" stroke="#c08040" stroke-width="1.5"/>
+    <line x1="55" y1="99" x2="65" y2="99" stroke="#c08040" stroke-width="1.5"/>
+    <line x1="55" y1="103" x2="65" y2="103" stroke="#c08040" stroke-width="1.5"/>
+    <!-- pommel -->
+    <ellipse cx="60" cy="108" rx="8" ry="6" fill="url(#swPommel)" stroke="#8a6000" stroke-width="2"/>
+    <ellipse cx="57" cy="106" rx="3" ry="2" fill="rgba(255,255,200,.5)"/>
+    </g>
+  </svg>`,
+
+  // ── CROWN ── golden Olympian crown with gems and spires
+  'crown': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="crGold" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fff8c0"/><stop offset="25%" stop-color="#ffe566"/><stop offset="60%" stop-color="#d4af37"/><stop offset="100%" stop-color="#7a5800"/></linearGradient>
+      <linearGradient id="crSide" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#ffe566"/><stop offset="100%" stop-color="#a07820"/></linearGradient>
+      <radialGradient id="crShine" cx="35%" cy="30%" r="60%"><stop offset="0%" stop-color="rgba(255,255,200,.6)"/><stop offset="100%" stop-color="rgba(255,255,200,0)"/></radialGradient>
+      <filter id="crF"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#crF)">
+    <!-- base band -->
+    <rect x="8" y="74" width="104" height="28" rx="6" fill="url(#crGold)" stroke="#7a5800" stroke-width="2"/>
+    <!-- band shine -->
+    <rect x="8" y="74" width="104" height="28" rx="6" fill="url(#crShine)" opacity=".5"/>
+    <!-- band gems row -->
+    <circle cx="28" cy="88" r="8" fill="#d03080" stroke="#fff" stroke-width="2"/>
+    <circle cx="25" cy="85" r="3" fill="rgba(255,255,255,.7)"/>
+    <circle cx="60" cy="88" r="8" fill="#20a0e0" stroke="#fff" stroke-width="2"/>
+    <circle cx="57" cy="85" r="3" fill="rgba(255,255,255,.7)"/>
+    <circle cx="92" cy="88" r="8" fill="#20c060" stroke="#fff" stroke-width="2"/>
+    <circle cx="89" cy="85" r="3" fill="rgba(255,255,255,.7)"/>
+    <!-- small gold circles between gems -->
+    <circle cx="44" cy="88" r="4" fill="url(#crGold)" stroke="#a07800" stroke-width="1"/>
+    <circle cx="76" cy="88" r="4" fill="url(#crGold)" stroke="#a07800" stroke-width="1"/>
+    <!-- crown spires -->
+    <polygon points="8,74 8,42 20,58 36,16 52,58 60,38 68,58 84,16 100,58 112,42 112,74" fill="url(#crGold)" stroke="#7a5800" stroke-width="2"/>
+    <!-- spire shine -->
+    <polygon points="8,74 8,42 20,58 36,16 52,58 60,38 68,58 84,16 100,58 112,42 112,74" fill="url(#crShine)" opacity=".4"/>
+    <!-- centre gem (big) -->
+    <polygon points="60,16 68,34 60,40 52,34" fill="#ff3030" stroke="#fff" stroke-width="1.5"/>
+    <circle cx="60" cy="24" r="3.5" fill="rgba(255,255,255,.7)"/>
+    <!-- side spire gems -->
+    <circle cx="36" cy="22" r="5" fill="#ffee44" stroke="#a07800" stroke-width="1.5"/>
+    <circle cx="84" cy="22" r="5" fill="#ffee44" stroke="#a07800" stroke-width="1.5"/>
+    <circle cx="34" cy="20" r="2" fill="rgba(255,255,255,.6)"/>
+    <circle cx="82" cy="20" r="2" fill="rgba(255,255,255,.6)"/>
+    <!-- spire inner details -->
+    <line x1="60" y1="40" x2="60" y2="74" stroke="rgba(200,150,0,.3)" stroke-width="1"/>
+    <line x1="8" y1="74" x2="60" y2="50" stroke="rgba(200,150,0,.2)" stroke-width="1"/>
+    <line x1="112" y1="74" x2="60" y2="50" stroke="rgba(200,150,0,.2)" stroke-width="1"/>
+    </g>
+  </svg>`,
+
+  // ── TRIDENT ── Poseidon's trident with ocean power
+  'trident': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="trSteel" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#a0d8f8"/><stop offset="25%" stop-color="#e0f4ff"/><stop offset="50%" stop-color="#ffffff"/><stop offset="75%" stop-color="#80c0e0"/><stop offset="100%" stop-color="#2080b0"/></linearGradient>
+      <linearGradient id="trShaft" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#2070a0"/><stop offset="50%" stop-color="#60b0d8"/><stop offset="100%" stop-color="#104060"/></linearGradient>
+      <radialGradient id="trOrb" cx="38%" cy="35%" r="60%"><stop offset="0%" stop-color="#c0f0ff"/><stop offset="50%" stop-color="#20a0e0"/><stop offset="100%" stop-color="#003060"/></radialGradient>
+      <radialGradient id="trGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(0,180,255,.25)"/><stop offset="100%" stop-color="rgba(0,180,255,0)"/></radialGradient>
+      <filter id="trF"><feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#trF)">
+    <!-- glow aura -->
+    <ellipse cx="60" cy="60" rx="55" ry="55" fill="url(#trGlow)"/>
+    <!-- shaft -->
+    <rect x="55" y="42" width="10" height="72" rx="5" fill="url(#trShaft)" stroke="#40a0c0" stroke-width="1.5"/>
+    <!-- shaft midline highlight -->
+    <line x1="60" y1="44" x2="60" y2="112" stroke="rgba(180,240,255,.5)" stroke-width="1.5"/>
+    <!-- cross-bar (binding) -->
+    <rect x="30" y="50" width="60" height="8" rx="4" fill="url(#trSteel)" stroke="#40a0c0" stroke-width="1.5"/>
+    <!-- cross-bar detail line -->
+    <line x1="30" y1="54" x2="90" y2="54" stroke="rgba(255,255,255,.4)" stroke-width="1"/>
+    <!-- outer prongs -->
+    <polygon points="32,10 38,54 26,52" fill="url(#trSteel)" stroke="#80d0f0" stroke-width="1.5"/>
+    <polygon points="88,10 92,52 82,54" fill="url(#trSteel)" stroke="#80d0f0" stroke-width="1.5"/>
+    <!-- prong edges -->
+    <line x1="32" y1="10" x2="32" y2="50" stroke="rgba(255,255,255,.6)" stroke-width="1"/>
+    <line x1="88" y1="10" x2="88" y2="50" stroke="rgba(255,255,255,.6)" stroke-width="1"/>
+    <!-- centre prong (tallest) -->
+    <polygon points="60,4 66,50 54,50" fill="url(#trSteel)" stroke="#a0e0ff" stroke-width="2"/>
+    <line x1="60" y1="4" x2="60" y2="48" stroke="rgba(255,255,255,.7)" stroke-width="1.5"/>
+    <!-- base orb -->
+    <circle cx="60" cy="112" r="8" fill="url(#trOrb)" stroke="#80d0f0" stroke-width="2"/>
+    <circle cx="57" cy="109" r="3" fill="rgba(255,255,255,.6)"/>
+    <!-- water droplets -->
+    <ellipse cx="30" cy="22" rx="4" ry="5" fill="#80e8ff" opacity=".9"/>
+    <ellipse cx="90" cy="22" rx="4" ry="5" fill="#80e8ff" opacity=".9"/>
+    <ellipse cx="60" cy="14" rx="3.5" ry="4.5" fill="#c0f4ff" opacity=".9"/>
+    <!-- water drop inner shine -->
+    <ellipse cx="28" cy="20" rx="1.5" ry="2" fill="rgba(255,255,255,.7)"/>
+    <ellipse cx="88" cy="20" rx="1.5" ry="2" fill="rgba(255,255,255,.7)"/>
+    </g>
+  </svg>`,
+
+  // ── DIAMOND ── premium multi-cut brilliant gem
+  'diamond': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="dTop" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#f0fbff"/><stop offset="50%" stop-color="#80e0ff"/><stop offset="100%" stop-color="#20a0e0"/></linearGradient>
+      <linearGradient id="dLeft" x1="1" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#40b8f0"/><stop offset="100%" stop-color="#005090"/></linearGradient>
+      <linearGradient id="dRight" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#60c8f8"/><stop offset="100%" stop-color="#2080b8"/></linearGradient>
+      <linearGradient id="dBottom" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0870a0"/><stop offset="100%" stop-color="#003060"/></linearGradient>
+      <radialGradient id="dFlash" cx="38%" cy="30%" r="50%"><stop offset="0%" stop-color="rgba(255,255,255,.9)"/><stop offset="100%" stop-color="rgba(255,255,255,0)"/></radialGradient>
+      <filter id="dF"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#dF)">
+    <!-- outer glow ring -->
+    <polygon points="60,6 106,40 60,114 14,40" fill="rgba(0,180,255,.12)" stroke="rgba(0,200,255,.3)" stroke-width="1"/>
+    <!-- main facets -->
+    <!-- top crown -->
+    <polygon points="60,10 106,42 60,44" fill="url(#dTop)" stroke="rgba(160,220,255,.4)" stroke-width="1"/>
+    <polygon points="60,10 14,42 60,44" fill="rgba(200,240,255,.5)" stroke="rgba(160,220,255,.4)" stroke-width="1"/>
+    <!-- upper girdle -->
+    <polygon points="60,44 106,42 84,76" fill="url(#dRight)" stroke="rgba(100,180,230,.3)" stroke-width=".8"/>
+    <polygon points="60,44 14,42 36,76" fill="url(#dLeft)" stroke="rgba(100,180,230,.3)" stroke-width=".8"/>
+    <!-- lower pavilion -->
+    <polygon points="84,76 60,44 60,110" fill="rgba(0,120,190,.8)" stroke="rgba(0,160,220,.3)" stroke-width=".8"/>
+    <polygon points="36,76 60,44 60,110" fill="rgba(0,100,160,.7)" stroke="rgba(0,160,220,.3)" stroke-width=".8"/>
+    <!-- bottom -->
+    <polygon points="60,110 84,76 36,76" fill="url(#dBottom)"/>
+    <!-- inner fire lines -->
+    <line x1="60" y1="10" x2="60" y2="110" stroke="rgba(255,255,255,.15)" stroke-width=".8"/>
+    <line x1="14" y1="42" x2="106" y2="42" stroke="rgba(255,255,255,.15)" stroke-width=".8"/>
+    <line x1="14" y1="42" x2="84" y2="76" stroke="rgba(255,255,255,.1)" stroke-width=".8"/>
+    <line x1="106" y1="42" x2="36" y2="76" stroke="rgba(255,255,255,.1)" stroke-width=".8"/>
+    <!-- table highlight flash -->
+    <polygon points="60,10 82,30 60,36 38,30" fill="url(#dFlash)"/>
+    <!-- sparkle crosses -->
+    <path d="M98,16 L100,22 L106,16 L100,10 Z M18,22 L20,28 L24,22 L20,16 Z M104,88 L106,92 L110,88 L106,84 Z" fill="white" opacity=".9"/>
+    <circle cx="52" cy="18" r="3" fill="white" opacity=".8"/>
+    </g>
+  </svg>`,
+
+  // ── WILD (Zeus thunderbolt) ── with rays, fire, divine power
+  'wild': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="wBolt" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ffffff"/><stop offset="15%" stop-color="#fffde0"/><stop offset="40%" stop-color="#ffee44"/><stop offset="70%" stop-color="#ff8800"/><stop offset="100%" stop-color="#cc2200"/></linearGradient>
+      <radialGradient id="wCore" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#ffffff" stop-opacity="1"/><stop offset="30%" stop-color="#ffee44" stop-opacity=".8"/><stop offset="100%" stop-color="#ff4400" stop-opacity="0"/></radialGradient>
+      <radialGradient id="wHalo" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#ff6600" stop-opacity=".6"/><stop offset="60%" stop-color="#ff2200" stop-opacity=".2"/><stop offset="100%" stop-color="#ff0000" stop-opacity="0"/></radialGradient>
+      <filter id="wF"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#wF)">
+    <!-- outer halo fire -->
+    <circle cx="60" cy="60" r="56" fill="url(#wHalo)"/>
+    <!-- rays -->
+    <line x1="60" y1="6" x2="60" y2="18" stroke="#ffaa00" stroke-width="2.5" opacity=".8"/>
+    <line x1="60" y1="102" x2="60" y2="114" stroke="#ff6600" stroke-width="2.5" opacity=".7"/>
+    <line x1="6" y1="60" x2="18" y2="60" stroke="#ffaa00" stroke-width="2.5" opacity=".8"/>
+    <line x1="102" y1="60" x2="114" y2="60" stroke="#ffaa00" stroke-width="2.5" opacity=".8"/>
+    <line x1="18" y1="18" x2="26" y2="26" stroke="#ffcc00" stroke-width="2" opacity=".7"/>
+    <line x1="94" y1="18" x2="86" y2="26" stroke="#ffcc00" stroke-width="2" opacity=".7"/>
+    <line x1="18" y1="102" x2="26" y2="94" stroke="#ff8800" stroke-width="2" opacity=".6"/>
+    <line x1="94" y1="102" x2="86" y2="94" stroke="#ff8800" stroke-width="2" opacity=".6"/>
+    <!-- inner glow -->
+    <circle cx="60" cy="60" r="32" fill="url(#wCore)"/>
+    <!-- bolt outer -->
+    <polygon points="72,8 44,54 60,54 48,112 88,50 68,50" fill="url(#wBolt)" stroke="#ffdd00" stroke-width="2" stroke-linejoin="round"/>
+    <!-- bolt inner bright -->
+    <polygon points="68,16 50,52 62,52 52,96 80,52 66,52" fill="rgba(255,255,200,.55)"/>
+    <!-- bolt core white -->
+    <polygon points="65,22 54,50 64,50 56,86 74,52 64,52" fill="rgba(255,255,255,.5)"/>
+    <!-- WILD banner -->
+    <rect x="30" y="84" width="60" height="16" rx="4" fill="rgba(180,30,0,.75)" stroke="#ff8800" stroke-width="1.5"/>
+    <text x="60" y="96" text-anchor="middle" font-family="Arial Black,sans-serif" font-size="11" font-weight="900" fill="#ffee44" letter-spacing="2">WILD</text>
+    </g>
+  </svg>`,
+
+  // ── SCATTER (lightning orb) ── electric divine orb
+  'scatter': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="scCore" cx="40%" cy="35%" r="65%"><stop offset="0%" stop-color="#f0fbff"/><stop offset="25%" stop-color="#80f0ff"/><stop offset="55%" stop-color="#0090e0"/><stop offset="100%" stop-color="#002060"/></radialGradient>
+      <radialGradient id="scGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#00d4ff" stop-opacity=".6"/><stop offset="70%" stop-color="#0040ff" stop-opacity=".2"/><stop offset="100%" stop-color="#0020a0" stop-opacity="0"/></radialGradient>
+      <radialGradient id="scInner" cx="38%" cy="35%" r="60%"><stop offset="0%" stop-color="rgba(255,255,255,.5)"/><stop offset="100%" stop-color="rgba(255,255,255,0)"/></radialGradient>
+      <filter id="scF"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#scF)">
+    <!-- outer glow field -->
+    <circle cx="60" cy="60" r="58" fill="url(#scGlow)"/>
+    <!-- orbit ring outer -->
+    <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(0,200,255,.5)" stroke-width="1.5" stroke-dasharray="5,4"/>
+    <!-- orbit ring inner -->
+    <circle cx="60" cy="60" r="40" fill="none" stroke="rgba(0,200,255,.3)" stroke-width="1" stroke-dasharray="3,5"/>
+    <!-- orb body -->
+    <circle cx="60" cy="60" r="36" fill="url(#scCore)" stroke="#80f0ff" stroke-width="2.5"/>
+    <!-- inner shine -->
+    <circle cx="60" cy="60" r="36" fill="url(#scInner)"/>
+    <!-- electric arcs around orb -->
+    <path d="M60,24 Q68,30 60,38" fill="none" stroke="#80f0ff" stroke-width="2" stroke-linecap="round" opacity=".9"/>
+    <path d="M96,60 Q88,68 80,60" fill="none" stroke="#80f0ff" stroke-width="2" stroke-linecap="round" opacity=".8"/>
+    <path d="M24,48 Q30,56 24,64" fill="none" stroke="#80f0ff" stroke-width="2" stroke-linecap="round" opacity=".8"/>
+    <!-- inner lightning bolt -->
+    <polygon points="68,30 48,60 64,60 52,90 80,56 62,56" fill="#ffffff" opacity=".9"/>
+    <polygon points="65,36 52,58 65,58 55,82 74,56 63,56" fill="#c0f0ff" opacity=".7"/>
+    <!-- orbit node dots -->
+    <circle cx="60" cy="8" r="4.5" fill="#80f0ff" stroke="rgba(255,255,255,.5)" stroke-width="1"/>
+    <circle cx="112" cy="60" r="4.5" fill="#80f0ff" stroke="rgba(255,255,255,.5)" stroke-width="1"/>
+    <circle cx="60" cy="112" r="4.5" fill="#80f0ff" stroke="rgba(255,255,255,.5)" stroke-width="1"/>
+    <circle cx="8" cy="60" r="4.5" fill="#80f0ff" stroke="rgba(255,255,255,.5)" stroke-width="1"/>
+    <circle cx="98" cy="18" r="3" fill="#c0f8ff"/>
+    <circle cx="22" cy="98" r="3" fill="#c0f8ff"/>
+    <!-- SCATTER banner -->
+    <rect x="20" y="86" width="80" height="16" rx="4" fill="rgba(0,30,80,.75)" stroke="#00d4ff" stroke-width="1.5"/>
+    <text x="60" y="98" text-anchor="middle" font-family="Arial Black,sans-serif" font-size="9.5" font-weight="900" fill="#80f0ff" letter-spacing="1">SCATTER</text>
+    </g>
+  </svg>`,
+
+  // ── OBOL (Charon's coin) ── ancient gold coin
+  'obol': `<svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="obFace" cx="35%" cy="30%" r="70%"><stop offset="0%" stop-color="#fffde0"/><stop offset="30%" stop-color="#ffe566"/><stop offset="60%" stop-color="#d4af37"/><stop offset="85%" stop-color="#a07820"/><stop offset="100%" stop-color="#6a5010"/></radialGradient>
+      <radialGradient id="obEdge" cx="50%" cy="50%" r="50%"><stop offset="80%" stop-color="transparent"/><stop offset="100%" stop-color="rgba(0,0,0,.5)"/></radialGradient>
+      <linearGradient id="obShine" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="rgba(255,255,220,.7)"/><stop offset="100%" stop-color="rgba(255,255,220,0)"/></linearGradient>
+      <filter id="obF"><feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <g filter="url(#obF)">
+    <!-- coin rim shadow -->
+    <circle cx="62" cy="62" r="48" fill="rgba(0,0,0,.5)"/>
+    <!-- coin face -->
+    <circle cx="60" cy="60" r="48" fill="url(#obFace)"/>
+    <!-- edge shading -->
+    <circle cx="60" cy="60" r="48" fill="url(#obEdge)"/>
+    <!-- rim beading -->
+    <circle cx="60" cy="60" r="44" fill="none" stroke="#a07820" stroke-width="2.5"/>
+    <circle cx="60" cy="60" r="40" fill="none" stroke="rgba(255,240,120,.3)" stroke-width="1"/>
+    <!-- shine overlay -->
+    <ellipse cx="40" cy="38" rx="18" ry="12" fill="url(#obShine)" transform="rotate(-30,40,38)"/>
+    <!-- Athena face profile (owl motif) -->
+    <ellipse cx="60" cy="52" rx="14" ry="16" fill="rgba(160,110,0,.4)"/>
+    <!-- owl eyes -->
+    <circle cx="55" cy="48" r="5" fill="#7a5800" stroke="#c09020" stroke-width="1.5"/>
+    <circle cx="65" cy="48" r="5" fill="#7a5800" stroke="#c09020" stroke-width="1.5"/>
+    <circle cx="55" cy="48" r="3" fill="#1a0800"/>
+    <circle cx="65" cy="48" r="3" fill="#1a0800"/>
+    <circle cx="54" cy="47" r="1.5" fill="rgba(255,255,255,.7)"/>
+    <circle cx="64" cy="47" r="1.5" fill="rgba(255,255,255,.7)"/>
+    <!-- beak -->
+    <polygon points="60,53 56,58 64,58" fill="#c09020"/>
+    <!-- olive branch -->
+    <path d="M30,76 Q40,70 50,76 Q60,82 70,76 Q80,70 90,76" fill="none" stroke="#6a8020" stroke-width="2" stroke-linecap="round"/>
+    <ellipse cx="40" cy="72" rx="5" ry="3" fill="#5a7010" transform="rotate(-20,40,72)"/>
+    <ellipse cx="55" cy="78" rx="5" ry="3" fill="#5a7010" transform="rotate(10,55,78)"/>
+    <ellipse cx="70" cy="74" rx="5" ry="3" fill="#5a7010" transform="rotate(-15,70,74)"/>
+    <ellipse cx="84" cy="78" rx="4" ry="2.5" fill="#5a7010" transform="rotate(5,84,78)"/>
+    <!-- rim tick marks -->
+    <circle cx="60" cy="12" r="2.5" fill="#d4af37"/>
+    <circle cx="60" cy="108" r="2.5" fill="#d4af37"/>
+    <circle cx="12" cy="60" r="2.5" fill="#d4af37"/>
+    <circle cx="108" cy="60" r="2.5" fill="#d4af37"/>
+    <circle cx="24" cy="24" r="2" fill="#c09020"/>
+    <circle cx="96" cy="24" r="2" fill="#c09020"/>
+    <circle cx="24" cy="96" r="2" fill="#c09020"/>
+    <circle cx="96" cy="96" r="2" fill="#c09020"/>
+    </g>
+  </svg>`
+};
+
+// Symbol keys used as IDs
+const paytable = {
+  'temple':[0,0,2,5,10],'amphora':[0,0,3,8,20],'shield':[0,0,5,15,30],
+  'sword':[0,0,8,20,50],'crown':[0,0,15,40,100],'trident':[0,0,25,75,250],'diamond':[0,0,50,150,500]
+};
+// Large diverse pool — same symbol 3× in a row is very rare
+const symPool=[
+  'temple','temple','temple','temple','temple','temple',
+  'amphora','amphora','amphora','amphora','amphora',
+  'shield','shield','shield','shield',
+  'sword','sword','sword',
+  'crown','crown','crown',
+  'trident','trident',
+  'diamond'
+];
+const WILD='wild',SCATTER='scatter',OBOL='obol';
+const PAYLINES=[[1,1,1,1,1],[0,0,0,0,0],[2,2,2,2,2],[0,1,2,1,0],[2,1,0,1,2],[1,0,0,0,1],[1,2,2,2,1],[0,0,1,2,2],[2,2,1,0,0],[0,1,1,1,0]];
+
+/* ══════════════════════════════════════════
+   DOM REFS
+══════════════════════════════════════════ */
+const gridEl    = document.getElementById('slot-grid');
+const msgEl     = document.getElementById('message');
+const attEl     = document.getElementById('attempts');
+const fsBar     = document.getElementById('free-spins-display');
+const fsEl      = document.getElementById('free-spins');
+const credEl    = document.getElementById('credits-display');
+const winEl     = document.getElementById('win-display');
+const bwOverlay = document.getElementById('big-win-overlay');
+const bwText    = document.getElementById('big-win-text');
+const bwAmt     = document.getElementById('big-win-amount');
+const obolEl    = document.getElementById('obol-display');
+const mqttHUD   = document.getElementById('mqtt-status');
+const sisyPush  = document.getElementById('sisyphus-pusher');
+const sisyMan   = document.getElementById('sisyphus-man');
+const sisyRock  = document.getElementById('sisyphus-boulder');
+const ltOverlay = document.getElementById('lightning-overlay');
+
+const COLS=5,ROWS=3,DOMGrid=[],DOMReels=[];
+
+/* render SVG symbol helper */
+function symHTML(key){
+  return SYMS[key]||SYMS['temple'];
+}
+
+/* build reels */
+for(let c=0;c<COLS;c++){
+  const reel=document.createElement('div');
+  reel.className='reel';DOMReels.push(reel);DOMGrid[c]=[];
+  for(let r=0;r<ROWS;r++){
+    const box=document.createElement('div');box.className='sym-box';
+    const cnt=document.createElement('div');cnt.className='sym-cnt';
+    cnt.innerHTML=symHTML('temple');cnt.dataset.symbol='temple';cnt.dataset.sym='temple';
+    box.appendChild(cnt);reel.appendChild(box);DOMGrid[c][r]=cnt;
+  }
+  gridEl.appendChild(reel);
+}
+function fmtNum(n){return n.toLocaleString();}
+function updateJPDisplay(){
+  document.getElementById('mega-val').innerText  = fmtNum(bet*1000);
+  document.getElementById('major-val').innerText = fmtNum(bet*100);
+  document.getElementById('minor-val').innerText = fmtNum(bet*20);
+}
+updateJPDisplay();
+
+/* ══════════════════════════════════════════
+   KEY INPUT
+══════════════════════════════════════════ */
+document.addEventListener('keydown',e=>{
+  if(e.code!=='Space')return;
+  e.preventDefault();
+  if(e.repeat)return;
+  handleAction();
+});
+
+/* ══════════════════════════════════════════
+   PARTICLES
+══════════════════════════════════════════ */
+function spawnParts(el,n,color){
+  const rect=el.getBoundingClientRect(),x=rect.left+rect.width/2,y=rect.top+rect.height/2;
+  for(let i=0;i<n;i++){
+    const p=document.createElement('div');p.className='particle';
+    p.style.cssText=`left:${x}px;top:${y}px;background:${color};box-shadow:0 0 8px ${color};width:${Math.random()*5+4}px;height:${Math.random()*5+4}px;`;
+    const a=Math.random()*Math.PI*2,d=Math.random()*130+40;
+    p.style.setProperty('--dx',Math.cos(a)*d+'px');
+    p.style.setProperty('--dy',Math.sin(a)*d+'px');
+    document.body.appendChild(p);setTimeout(()=>p.remove(),800);
+  }
+}
+function massParts(col){for(let i=0;i<8;i++)setTimeout(()=>spawnParts(DOMGrid[Math.floor(Math.random()*COLS)][Math.floor(Math.random()*ROWS)].parentElement,22,col),i*100);}
+function coinShower(n){n=Math.min(n,80);for(let i=0;i<n;i++)setTimeout(()=>{const c=document.createElement('div');c.className='coin';c.style.left=(Math.random()*90+5)+'vw';document.body.appendChild(c);setTimeout(()=>c.remove(),2000);},i*30);}
+
+/* ══════════════════════════════════════════
+   FLOATING WIN TEXT
+══════════════════════════════════════════ */
+function spawnFloatWin(text,x,y,size='1.8rem',color=null){
+  const el=document.createElement('div');
+  el.className='float-win';
+  el.innerText=text;
+  el.style.left=x+'px';el.style.top=y+'px';
+  el.style.fontSize=size;
+  if(color)el.style.color=color;
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(),1500);
+}
+
+/* ══════════════════════════════════════════
+   LIGHTNING FLASH (Zeus theme)
+══════════════════════════════════════════ */
+function zeusLightning(count=3){
+  for(let i=0;i<count;i++){
+    setTimeout(()=>{
+      ltOverlay.classList.remove('strike');
+      void ltOverlay.offsetWidth;
+      ltOverlay.classList.add('strike');
+      sfx('thunder');
+      // spawn SVG bolt at random reel
+      const c=Math.floor(Math.random()*COLS);
+      const rr=DOMReels[c].getBoundingClientRect();
+      const bolt=document.createElement('div');
+      bolt.innerHTML='<svg viewBox="0 0 40 120" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M22 0 L8 55 L18 55 L4 120 L32 45 L20 45 Z" fill="#00d4ff" stroke="#fff" stroke-width="1.5"/></svg>';
+      bolt.className='lightning-bolt animate';
+      bolt.style.left=(rr.left+rr.width/2-40)+'px';
+      bolt.style.top=(rr.top-20)+'px';
+      document.body.appendChild(bolt);
+      setTimeout(()=>{bolt.remove();ltOverlay.classList.remove('strike');},600);
+    },i*280);
+  }
+}
+
+/* ══════════════════════════════════════════
+   AUDIO
+══════════════════════════════════════════ */
+let audioCtx,musicInterval,musicOn=false,musicStep=0;
+function initAudio(){
+  if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+  if(audioCtx.state==='suspended')audioCtx.resume();
+  if(!musicOn){startMusic();musicOn=true;}
+}
+document.addEventListener('click',()=>initAudio(),{once:true});
+
+function startMusic(bonus=false,jackpot=false){
+  if(musicInterval)clearInterval(musicInterval);
+  const notes=bonus?[220,261.63,293.66,329.63,392]:[110,130.81,146.83,164.81];
+  const spd=(bonus||jackpot)?110:180;
+  musicInterval=setInterval(()=>{
+    if(!audioCtx)return;
+    const t=audioCtx.currentTime;
+    if(musicStep%4===0){const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.type='sine';o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(.01,t+.1);g.gain.setValueAtTime(bonus?.4:.2,t);g.gain.exponentialRampToValueAtTime(.01,t+.1);o.start(t);o.stop(t+.1);}
+    if(musicStep%8===0||musicStep%8===3){const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.type=bonus?'sawtooth':'sine';o.frequency.setValueAtTime(bonus?55:65.41,t);g.gain.setValueAtTime(bonus?.2:.15,t);g.gain.exponentialRampToValueAtTime(.01,t+.2);o.start(t);o.stop(t+.2);}
+    const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.type=bonus?'sawtooth':'triangle';o.frequency.setValueAtTime(notes[Math.floor(Math.random()*notes.length)],t);g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(bonus?.04:.06,t+.02);g.gain.linearRampToValueAtTime(0,t+.1);o.start(t);o.stop(t+.1);
+    musicStep=(musicStep+1)%16;
+  },spd);
+}
+
+function sfx(type,p=0){
+  if(!audioCtx)return;
+  const t=audioCtx.currentTime,o=audioCtx.createOscillator(),g=audioCtx.createGain();
+  o.connect(g);g.connect(audioCtx.destination);
+  ({
+    tick:      ()=>{o.type='triangle';o.frequency.setValueAtTime(120,t);o.frequency.exponentialRampToValueAtTime(30,t+.05);g.gain.setValueAtTime(.05,t);g.gain.exponentialRampToValueAtTime(.01,t+.05);o.start(t);o.stop(t+.05);},
+    stop:      ()=>{
+      // punchy click-thud
+      const o2=audioCtx.createOscillator(),g2=audioCtx.createGain();
+      o2.connect(g2);g2.connect(audioCtx.destination);
+      o2.type='sine';o2.frequency.setValueAtTime(200,t);o2.frequency.exponentialRampToValueAtTime(40,t+.08);
+      g2.gain.setValueAtTime(.6,t);g2.gain.exponentialRampToValueAtTime(.01,t+.12);o2.start(t);o2.stop(t+.12);
+      o.type='square';o.frequency.setValueAtTime(60,t);o.frequency.exponentialRampToValueAtTime(15,t+.1);g.gain.setValueAtTime(.35,t);g.gain.exponentialRampToValueAtTime(.01,t+.1);o.start(t);o.stop(t+.1);
+    },
+    wildLand:  ()=>{o.type='square';o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(40,t+.3);g.gain.setValueAtTime(.25,t);g.gain.exponentialRampToValueAtTime(.01,t+.3);o.start(t);o.stop(t+.3);},
+    expand:    ()=>{o.type='sawtooth';o.frequency.setValueAtTime(80,t);o.frequency.linearRampToValueAtTime(800,t+.5);g.gain.setValueAtTime(.4,t);g.gain.linearRampToValueAtTime(0,t+.5);o.start(t);o.stop(t+.5);},
+    lineWin:   ()=>{o.type='square';const f=300*Math.pow(1.05946,p*2);o.frequency.setValueAtTime(f,t);o.frequency.setValueAtTime(f*1.25,t+.1);g.gain.setValueAtTime(.15,t);g.gain.linearRampToValueAtTime(0,t+.5);o.start(t);o.stop(t+.5);},
+    rollupTick:()=>{o.type='triangle';o.frequency.setValueAtTime(400+(p*2),t);g.gain.setValueAtTime(.05,t);g.gain.exponentialRampToValueAtTime(.01,t+.05);o.start(t);o.stop(t+.05);},
+    tierHit:   ()=>{o.type='square';const f=[0,440,554.37,659.25,880][p];o.frequency.setValueAtTime(f,t);o.frequency.setValueAtTime(f*1.5,t+.1);g.gain.setValueAtTime(.3,t);g.gain.linearRampToValueAtTime(0,t+1.5);o.start(t);o.stop(t+1.5);},
+    heartbeat: ()=>{o.type='sine';o.frequency.setValueAtTime(60,t);o.frequency.exponentialRampToValueAtTime(40,t+.3);g.gain.setValueAtTime(.5,t);g.gain.exponentialRampToValueAtTime(.01,t+.3);o.start(t);o.stop(t+.3);},
+    thunder:   ()=>{
+      // thunder crack for Zeus
+      o.type='sawtooth';o.frequency.setValueAtTime(180,t);o.frequency.exponentialRampToValueAtTime(20,t+.6);
+      g.gain.setValueAtTime(.7,t);g.gain.exponentialRampToValueAtTime(.01,t+.8);o.start(t);o.stop(t+.8);
+      const n=audioCtx.createOscillator(),ng=audioCtx.createGain();
+      n.connect(ng);ng.connect(audioCtx.destination);
+      n.type='sawtooth';n.frequency.setValueAtTime(600,t);n.frequency.exponentialRampToValueAtTime(40,t+.3);
+      ng.gain.setValueAtTime(.5,t);ng.gain.exponentialRampToValueAtTime(.01,t+.3);n.start(t);n.stop(t+.3);
+    },
+    inferno:   ()=>{o.type='sawtooth';o.frequency.setValueAtTime(40,t);o.frequency.exponentialRampToValueAtTime(800,t+2);g.gain.setValueAtTime(.6,t);g.gain.linearRampToValueAtTime(0,t+3);const n=audioCtx.createOscillator();n.type='square';n.frequency.setValueAtTime(100,t);n.frequency.exponentialRampToValueAtTime(10,t+2);n.connect(g);n.start(t);n.stop(t+3);o.start(t);o.stop(t+3);},
+    obol:      ()=>{o.type='sine';o.frequency.setValueAtTime(1200,t);o.frequency.exponentialRampToValueAtTime(1800,t+.3);g.gain.setValueAtTime(.2,t);g.gain.linearRampToValueAtTime(0,t+.3);o.start(t);o.stop(t+.3);},
+    retrigger: ()=>{o.type='square';o.frequency.setValueAtTime(600,t);o.frequency.linearRampToValueAtTime(900,t+.2);g.gain.setValueAtTime(.2,t);g.gain.linearRampToValueAtTime(0,t+.4);o.start(t);o.stop(t+.4);}
+  }[type]||function(){})();
+}
+
+/* ══════════════════════════════════════════
+   CONTROLS
+══════════════════════════════════════════ */
+function handleAction(){
+  initAudio();
+  if     (gs===S_IDLE)    spin();
+  else if(gs===S_SPIN)    quickStop();
+  else if(gs===S_EVAL)    skipEval();
+  else if(gs===S_LINES)   skipLines();
+  else if(gs===S_ROLLUP)  skipRollup();
+  else if(gs===S_TRANS)   skipTrans();
+  else if(gs===S_JP_SPIN) quickJPStop();
+}
+
+/* MQTT */
+try{
+  const mc=mqtt.connect('wss://mqtt.nextservices.dk:443');
+  mc.on('connect',()=>{mqttHUD.className='mqtt-hud connected';mqttHUD.innerText='MQTT: CONNECTED';mc.subscribe('next/slotmachine');});
+  mc.on('message',(t,m)=>{if(t==='next/slotmachine'&&m.toString()==='pull')handleAction();});
+  mc.on('error',()=>{mqttHUD.className='mqtt-hud disconnected';mqttHUD.innerText='MQTT: ERROR';});
+  mc.on('close',()=>{mqttHUD.className='mqtt-hud disconnected';mqttHUD.innerText='MQTT: DISCONNECTED';});
+}catch(e){}
+
+/* ══════════════════════════════════════════
+   SYMBOL HELPERS
+══════════════════════════════════════════ */
+// Extreme rarity: OBOL 0.4%, SCATTER 0.7%, WILD 1.2%
+function randSym(){
+  const r=Math.random();
+  if(r<.004)return OBOL;
+  if(r<.011)return SCATTER;
+  if(r<.023)return WILD;
+  return symPool[Math.floor(Math.random()*symPool.length)];
+}
+function setSym(el,sym,final=false){
+  if(typeof sym==='object'){
+    // jackpot coin with value
+    el.innerHTML=symHTML(OBOL)+`<div class="coin-val">${sym.val}</div>`;
+    el.dataset.symbol=OBOL;el.dataset.sym=OBOL;
+    el.classList.remove('wild-symbol','static-wild');return;
+  }
+  el.innerHTML=symHTML(sym);
+  el.dataset.symbol=sym;el.dataset.sym=sym;
+  el.classList.remove('wild-symbol','static-wild','obol-symbol','scatter-glow');
+  if(sym===WILD)   el.classList.add(final?'wild-symbol':'static-wild');
+  if(sym===OBOL&&final)    el.classList.add('obol-symbol');
+  if(sym===SCATTER&&final) el.classList.add('scatter-glow');
+}
+function setMsg(txt,col='#ffe8a0'){msgEl.innerText=txt;msgEl.style.color=col;}
+
+/* HUD value bump animation */
+function hudBump(el){
+  el.classList.remove('bump');void el.offsetWidth;el.classList.add('bump');
+  setTimeout(()=>el.classList.remove('bump'),350);
+}
+
+/* ══════════════════════════════════════════
+   SPIN
+══════════════════════════════════════════ */
+function spin(){
+  if(gs!==S_IDLE)return;
+  if(!isWildRespin&&freeSpins<=0){
+    if(souls<bet){setMsg('NOT ENOUGH GOLD!','#cf352e');return;}
+    souls-=bet;credEl.innerText=souls;obolsCollected=0;obolEl.innerText='0';
+  }
+  gs=S_SPIN;
+  winEl.innerText='0';bwOverlay.classList.remove('show');
+  document.body.classList.remove('shake','violent-shake','full-tartarus');
+  DOMReels.forEach(r=>r.classList.remove('wild-expand-burst','anticipation'));
+  if(inBonus){isWildRespin=false;activeWildsNow=[];freeSpins--;fsEl.innerText=freeSpins;setMsg('⚡ Zeus Strikes!','#00f3ff');}
+  else{
+    activeWildsNow=fallingWilds.map(w=>({c:w.c,r:w.r+1})).filter(w=>w.r<ROWS);
+    if(!activeWildsNow.length)isWildRespin=false;
+    setMsg(isWildRespin?'🔥 The Flame Descends':'The Reels of Fate Turn…',isWildRespin?'#ff6b00':'#ffe8a0');
+    if(!isWildRespin){attempts++;attEl.innerText=attempts;}
+  }
+  reelStopped=[...stickyReels];
+  if(isWildRespin&&fallingWilds.length){fallingWilds.forEach(w=>DOMGrid[w.c][w.r].parentElement.classList.add('slide-down'));setTimeout(startPhysical,350);}
+  else startPhysical();
+}
+
+function startPhysical(){
+  tickInterval=setInterval(()=>sfx('tick'),100);
+  for(let c=0;c<COLS;c++){if(!stickyReels[c])for(let r=0;r<ROWS;r++){
+    const el=DOMGrid[c][r];
+    el.parentElement.classList.remove('win-flash','win-flash-static','slide-down');
+    el.classList.remove('roll-back','heavy-stop','scatter-pulse','scatter-glow','win-glow');
+    const fall=!inBonus&&activeWildsNow.some(w=>w.c===c&&w.r===r);
+    if(fall)setSym(el,WILD,false);else{void el.offsetWidth;el.classList.add('spinning');}
+  }}
+  visualInterval=setInterval(()=>{for(let c=0;c<COLS;c++)if(!reelStopped[c])for(let r=0;r<ROWS;r++)if(!(!inBonus&&activeWildsNow.some(w=>w.c===c&&w.r===r)))setSym(DOMGrid[c][r],randSym(),false);},80);
+  stopTimeouts=[];let sl=0;
+  for(let c=0;c<COLS;c++){if(!stickyReels[c]){
+    let isLast=true;for(let n=c+1;n<COLS;n++)if(!stickyReels[n])isLast=false;
+    // 600ms between column stops — real-slot feel
+    stopTimeouts.push(setTimeout(()=>{stopReel(c,isLast,sl);for(let r=0;r<ROWS;r++)if(DOMGrid[c][r].dataset.symbol===SCATTER)sl++;},600+c*600));
+  }}
+  if(stickyReels.every(v=>v)){clearInterval(visualInterval);clearInterval(tickInterval);setTimeout(checkOutcome,100);}
+}
+
+function quickStop(){
+  if(gs!==S_SPIN)return;gs=S_STOP;stopTimeouts.forEach(clearTimeout);stopTimeouts=[];
+  DOMReels.forEach(r=>r.classList.remove('anticipation'));
+  const cs=[];for(let c=0;c<COLS;c++)if(!reelStopped[c])cs.push(c);
+  cs.forEach((c,i)=>setTimeout(()=>stopReel(c,i===cs.length-1,0),i*40));
+}
+
+function stopReel(ci,isLast,sh=0){
+  reelStopped[ci]=true;DOMReels[ci].classList.remove('anticipation');
+  if(sh>=2&&ci<COLS-1&&gs!==S_STOP&&!stickyReels[ci+1]){DOMReels[ci+1].classList.add('anticipation');sfx('heartbeat');}
+  let hasWild=false,ww=false,finals=[];
+  for(let r=0;r<ROWS;r++){const rs=randSym(),f=!inBonus&&activeWildsNow.some(w=>w.c===ci&&w.r===r);if(f&&rs===WILD)ww=true;finals.push(f?WILD:rs);}
+  if(ww&&!inBonus){finals=[WILD,WILD,WILD];sfx('expand');DOMReels[ci].classList.add('wild-expand-burst');for(let r=0;r<ROWS;r++)spawnParts(DOMGrid[ci][r].parentElement,20,'#ff6b00');}
+  if(inBonus&&finals.includes(WILD)&&!stickyReels[ci]){finals=[WILD,WILD,WILD];stickyReels[ci]=true;sfx('expand');DOMReels[ci].classList.add('locked-wild','wild-expand-burst');for(let r=0;r<ROWS;r++)spawnParts(DOMGrid[ci][r].parentElement,15,'#ff6b00');hasWild=true;}
+  for(let r=0;r<ROWS;r++){
+    const el=DOMGrid[ci][r];
+    el.classList.remove('spinning');
+    setSym(el,finals[r],true);
+    el.classList.add('heavy-stop');
+    if(finals[r]===WILD)hasWild=true;
+  }
+  sfx('stop');if(hasWild&&!ww&&!inBonus)sfx('wildLand');
+  if(isLast){clearInterval(visualInterval);clearInterval(tickInterval);DOMReels.forEach(r=>r.classList.remove('anticipation'));setTimeout(checkOutcome,gs===S_STOP?300:700);}
+}
+
+/* ══════════════════════════════════════════
+   EVALUATION
+══════════════════════════════════════════ */
+function checkOutcome(){
+  gs=S_EVAL;activeWinData=checkPaylines();const scatters=getScatters();
+  fallingWilds=[];let wc=0;
+  for(let c=0;c<COLS;c++)for(let r=0;r<ROWS;r++){if(DOMGrid[c][r].dataset.symbol===WILD){if(!inBonus)fallingWilds.push({c,r});wc++;}}
+  isWildRespin=(!inBonus&&fallingWilds.length>0);
+  const oe=[];
+  for(let c=0;c<COLS;c++){if(stickyReels[c])continue;for(let r=0;r<ROWS;r++)if(DOMGrid[c][r].dataset.symbol===OBOL&&!inBonus)oe.push(DOMGrid[c][r]);}
+  if(oe.length&&!inBonus)oe.forEach((el,i)=>setTimeout(()=>{
+    sfx('obol');obolsCollected=Math.min(obolsCollected+1,3);obolEl.innerText=obolsCollected;hudBump(document.querySelector('.hc.obol .hv'));
+    const fly=document.createElement('div');fly.className='flying-obol';fly.innerHTML=symHTML(OBOL);fly.style.width='36px';fly.style.height='36px';
+    const rr=el.getBoundingClientRect(),tr=obolEl.getBoundingClientRect();
+    fly.style.cssText=`left:${rr.left}px;top:${rr.top}px;`;
+    document.body.appendChild(fly);void fly.offsetWidth;
+    fly.style.left=tr.left+'px';fly.style.top=tr.top+'px';
+    setTimeout(()=>fly.remove(),600);
+  },i*300));
+  const delay=(oe.length&&!inBonus)?(oe.length*300+400):0;
+  evalTid=setTimeout(()=>{
+    if(inBonus&&(wc===15||stickyReels.every(v=>v))){
+      if(!infernoPlayed){infernoPlayed=true;document.body.classList.add('full-tartarus');sfx('inferno');msgEl.innerHTML='<span class="inferno-txt">ABSOLUTE INFERNO!</span>';evalTid=setTimeout(()=>evalWins(activeWinData),3500);return;}
+      else{document.body.classList.add('full-tartarus');msgEl.innerHTML='<span class="inferno-txt">ABSOLUTE INFERNO!</span>';}
+    }
+    if(inBonus&&scatters.length){freeSpins+=scatters.length*2;fsEl.innerText=freeSpins;scatters.forEach(el=>{el.classList.add('scatter-pulse');spawnParts(el,15,'#00f3ff');});msgEl.innerHTML=`<span class="retrigger-msg">+${scatters.length*2} SPINS!</span>`;evalTid=setTimeout(()=>evalWins(activeWinData),1200);}
+    else if(scatters.length>=3&&!inBonus){scatters.forEach(el=>{el.classList.add('scatter-pulse');spawnParts(el,20,'#00f3ff');});triggerBonus();}
+    else evalWins(activeWinData);
+  },delay);
+}
+function skipEval(){if(evalTid){clearTimeout(evalTid);evalTid=null;evalWins(activeWinData);}}
+function checkPaylines(){
+  let lines=[],total=0,lb=bet/10;
+  PAYLINES.forEach((line,idx)=>{
+    let count=1,sym=DOMGrid[0][line[0]].dataset.symbol;
+    if(sym===WILD)for(let c=1;c<COLS;c++)if(DOMGrid[c][line[c]].dataset.symbol!==WILD){sym=DOMGrid[c][line[c]].dataset.symbol;break;}
+    if(sym===SCATTER||sym===OBOL)return;
+    const els=[DOMGrid[0][line[0]]];
+    for(let c=1;c<COLS;c++){const ns=DOMGrid[c][line[c]].dataset.symbol;if(ns===sym||ns===WILD){count++;els.push(DOMGrid[c][line[c]]);}else break;}
+    if(count>=3){const m=paytable[sym]?paytable[sym][count-1]:0,w=m*lb;if(w>0){total+=w;lines.push({elements:els,symbol:sym,count,lineIndex:idx+1,winAmount:w});}}
+  });
+  return{winningLines:lines,totalWin:total};
+}
+function getScatters(){const s=[];for(let c=0;c<COLS;c++){if(stickyReels[c])continue;for(let r=0;r<ROWS;r++)if(DOMGrid[c][r].dataset.symbol===SCATTER)s.push(DOMGrid[c][r]);}return s;}
+function triggerBonus(){
+  fallingWilds=[];isWildRespin=false;infernoPlayed=false;inBonus=true;freeSpins=8;
+  zeusLightning(4);
+  setTimeout(()=>{
+    document.body.classList.add('shake','bonus-mode');
+    setMsg('⚡ ZEUS WRATH UNLEASHED! ⚡','#00f3ff');
+    fsBar.style.display='block';fsEl.innerText=freeSpins;startMusic(true);
+    setTimeout(()=>{document.body.classList.remove('shake');gs=S_IDLE;spin();},2500);
+  },1000);
+}
+function evalWins(data){if(data.winningLines.length){gs=S_LINES;showLines(data);}else rollback();}
+
+/* ══════════════════════════════════════════
+   WIN LINES — with floating text & symbol glow
+══════════════════════════════════════════ */
+let lineIdx=0,dispWin=0;
+function showLines(data){activeWinData=data;lineIdx=0;dispWin=0;nextLine();}
+function nextLine(){
+  if(gs!==S_LINES)return;
+  if(lineIdx>=activeWinData.winningLines.length){startRollup(activeWinData);return;}
+  const ln=activeWinData.winningLines[lineIdx];sfx('lineWin',lineIdx);
+  dispWin+=ln.winAmount;winEl.innerText=dispWin;hudBump(winEl);
+  ln.elements.forEach(el=>{
+    el.parentElement.classList.remove('win-flash','win-flash-static');
+    void el.parentElement.offsetWidth;
+    el.parentElement.classList.add('win-flash');
+    // symbol win glow
+    el.classList.remove('win-glow');void el.offsetWidth;el.classList.add('win-glow');
+    spawnParts(el.parentElement,5,'#d4af37');
+    // floating +amount text near winning symbol
+    const rect=el.getBoundingClientRect();
+    spawnFloatWin('+'+ln.winAmount,rect.left+rect.width/2,rect.top,'1.4rem','#ffe566');
+  });
+  if(!msgEl.innerText.includes('+')&&!document.body.classList.contains('full-tartarus'))
+    setMsg(`Line ${ln.lineIndex} Win!  +${ln.winAmount}`);
+  lineIdx++;winTid=setTimeout(nextLine,750);
+}
+function skipLines(){if(gs!==S_LINES)return;clearTimeout(winTid);activeWinData.winningLines.forEach(l=>l.elements.forEach(e=>e.parentElement.classList.add('win-flash-static')));startRollup(activeWinData);}
+
+/* ══════════════════════════════════════════
+   ROLLUP — SISYPHUS
+══════════════════════════════════════════ */
+let ruT=0,ruC=0,ruTier=0,lastTick=0;
+function sisySpeed(s){sisyRock.style.animationDuration=s+'s';sisyMan.style.animationDuration=s+'s';}
+function startRollup(data){
+  const mult=data.totalWin/bet;souls+=data.totalWin;credEl.innerText=souls;hudBump(credEl);
+  if(mult>=10){
+    gs=S_ROLLUP;ruT=data.totalWin;ruC=0;ruTier=0;
+    sisyPush.style.transition='left .1s linear';sisyPush.style.left='0%';sisySpeed(1.2);
+    bwOverlay.classList.add('show');bwAmt.innerText='0';bwAmt.style.color='#fff';bwText.innerText='WINNING';bwText.style.color='var(--gold)';
+    rafId=requestAnimationFrame(ruLoop);
+  }else{
+    gs=S_TRANS;winEl.innerText=data.totalWin;hudBump(winEl);
+    if(!msgEl.innerText.includes('+')&&!document.body.classList.contains('full-tartarus'))setMsg('Total Win: '+data.totalWin);
+    transTid=setTimeout(rollback,800);
+  }
+}
+function ruLoop(ts){
+  if(gs!==S_ROLLUP)return;
+  let next=ruT;const ms=[bet*10,bet*25,bet*50,bet*100];for(const m of ms)if(ruC<m&&ruT>=m){next=m;break;}
+  let d=next-ruC,inc=d>200?d*.1:d>50?d*.05:d>15?.5:.10;if(inc<.10)inc=.10;
+  ruC+=inc;if(ruC>ruT)ruC=ruT;bwAmt.innerText=Math.floor(ruC);winEl.innerText=Math.floor(ruC);
+  sisyPush.style.left=((ruC/ruT)*85)+'%';
+  if(ts-lastTick>40&&ruC<ruT){sfx('rollupTick',(ruC/ruT)*100);lastTick=ts;}
+  const cm=ruC/bet;
+  if(cm>=100&&ruTier<4){ruTier=4;upgradeTier('GODLIKE WIN!','#00d4ff',4,.1);document.body.classList.add('violent-shake');coinShower(80);zeusLightning(5);}
+  else if(cm>=50&&ruTier<3){ruTier=3;upgradeTier('EPIC WIN!','#ff6b00',3,.25);document.body.classList.add('shake');coinShower(50);}
+  else if(cm>=25&&ruTier<2){ruTier=2;upgradeTier('MEGA WIN!','#ffe566',2,.4);document.body.classList.add('shake');coinShower(25);}
+  else if(cm>=10&&ruTier<1){ruTier=1;upgradeTier('BIG WIN!','#fff',1,.7);}
+  if(ruC>=ruT)finishRollup();else rafId=requestAnimationFrame(ruLoop);
+}
+function skipRollup(){
+  if(gs!==S_ROLLUP)return;cancelAnimationFrame(rafId);ruC=ruT;
+  const fm=ruT/bet;
+  if(fm>=100){upgradeTier('GODLIKE WIN!','#00d4ff',4,.1);document.body.classList.add('violent-shake');coinShower(80);}
+  else if(fm>=50){upgradeTier('EPIC WIN!','#ff6b00',3,.25);document.body.classList.add('shake');coinShower(50);}
+  else if(fm>=25){upgradeTier('MEGA WIN!','#ffe566',2,.4);document.body.classList.add('shake');coinShower(25);}
+  else if(fm>=10){upgradeTier('BIG WIN!','#fff',1,.7);}
+  bwAmt.innerText=ruT;winEl.innerText=ruT;sisyPush.style.left='85%';finishRollup(true);
+}
+function finishRollup(sk=false){
+  gs=S_TRANS;sisyPush.style.transition='left .6s cubic-bezier(.55,.085,.68,.53)';sisyPush.style.left='0%';
+  finishTid=setTimeout(()=>{document.body.classList.remove('shake','violent-shake');bwOverlay.classList.remove('show');rollback();},sk?1500:(ruTier>=3?2500:1500));
+}
+function upgradeTier(txt,col,tier,spd){
+  bwText.innerText=txt;bwText.style.color=col;bwAmt.style.color=col;sisySpeed(spd);sfx('tierHit',tier);massParts(col);
+  // floating tier text in centre
+  spawnFloatWin(txt,window.innerWidth/2,window.innerHeight/2,`clamp(2rem,5vw,3.5rem)`,col);
+}
+
+/* ══════════════════════════════════════════
+   ROLLBACK / NEXT
+══════════════════════════════════════════ */
+function rollback(){
+  gs=S_TRANS;document.body.classList.remove('shake','violent-shake');bwOverlay.classList.remove('show');
+  if(obolsCollected>=3&&!inBonus){transTid=setTimeout(startJackpot,1000);return;}
+  if(!isWildRespin){
+    if(!msgEl.innerText.includes('+')&&!document.body.classList.contains('full-tartarus'))setMsg('The gods reclaim it all…','#cf352e');
+    for(let c=0;c<COLS;c++)if(!stickyReels[c])for(let r=0;r<ROWS;r++)DOMGrid[c][r].classList.add('roll-back');
+  }else{
+    if(!msgEl.innerText.includes('+')&&!document.body.classList.contains('full-tartarus'))setMsg('🔥 The Flame Descends…','#ff6b00');
+  }
+  transTid=setTimeout(nextSpin,900);
+}
+function skipTrans(){
+  if(finishTid){clearTimeout(finishTid);finishTid=null;rollback();}
+  else if(transTid){clearTimeout(transTid);transTid=null;if(obolsCollected>=3&&!inBonus)startJackpot();else nextSpin();}
+}
+function nextSpin(){
+  document.body.classList.remove('full-tartarus');
+  if(isWildRespin||freeSpins>0){gs=S_IDLE;spin();}
+  else{
+    if(inBonus){inBonus=false;infernoPlayed=false;document.body.classList.remove('bonus-mode');fsBar.style.display='none';startMusic();setMsg('The Olympians are pleased…');fallingWilds=[];activeWildsNow=[];stickyReels=[false,false,false,false,false];DOMReels.forEach(r=>r.classList.remove('locked-wild'));for(let c=0;c<COLS;c++)for(let r=0;r<ROWS;r++){DOMGrid[c][r].classList.add('roll-back');DOMGrid[c][r].classList.remove('wild-symbol','static-wild','scatter-glow');}}
+    gs=S_IDLE;
+  }
+}
+
+/* ══════════════════════════════════════════
+   JACKPOT BONUS
+══════════════════════════════════════════ */
+function startJackpot(){
+  gs=S_TRANS;obolsCollected=0;obolEl.innerText='0';
+  document.body.classList.add('shake','bonus-mode');sfx('inferno');
+  zeusLightning(3);
+  bwOverlay.classList.add('show');bwText.innerText="CHARON'S TOLL";bwText.style.color='#ffe566';bwAmt.innerText='JACKPOT BONUS';bwAmt.style.color='#fff';sisyPush.style.display='none';
+  transTid=setTimeout(()=>{bwOverlay.classList.remove('show');sisyPush.style.display='flex';document.body.classList.remove('shake');initJPBoard();},3000);
+}
+function initJPBoard(){
+  jackpotGrid=[[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]];jackpotSpins=3;jpTotal=0;winEl.innerText='0';
+  fsBar.style.display='block';fsEl.innerText=jackpotSpins;setMsg('COLLECT THE OBOLS!','#ffe566');
+  for(let c=0;c<COLS;c++)for(let r=0;r<ROWS;r++){DOMGrid[c][r].parentElement.classList.remove('win-flash','win-flash-static');DOMGrid[c][r].classList.remove('roll-back','heavy-stop','scatter-pulse','scatter-glow','win-glow');DOMGrid[c][r].innerText='';}
+  for(let i=0;i<3;i++){let c,r;do{c=Math.floor(Math.random()*COLS);r=Math.floor(Math.random()*ROWS);}while(jackpotGrid[c][r]!==0);const val=bet*[1,2,3,5][Math.floor(Math.random()*4)];jackpotGrid[c][r]=val;jpTotal+=val;setSym(DOMGrid[c][r],{val},true);}
+  startMusic(false,true);setTimeout(jpSpin,1000);
+}
+function jpSpin(){
+  if(jackpotSpins<=0){endJP();return;}
+  gs=S_JP_SPIN;jackpotSpins--;fsEl.innerText=jackpotSpins;jpEmpty=[];stopTimeouts=[];
+  for(let c=0;c<COLS;c++)for(let r=0;r<ROWS;r++)if(jackpotGrid[c][r]===0){jpEmpty.push({c,r});DOMGrid[c][r].innerText='';void DOMGrid[c][r].offsetWidth;DOMGrid[c][r].classList.add('spinning');}
+  if(!jpEmpty.length){endJP();return;}
+  tickInterval=setInterval(()=>sfx('tick'),100);
+  jpEmpty.forEach((cell,i)=>{const il=(i===jpEmpty.length-1);stopTimeouts.push(setTimeout(()=>jpStopReel(cell.c,cell.r,il),500+i*300));});
+}
+function quickJPStop(){if(gs!==S_JP_SPIN)return;gs=S_JP_STOP;stopTimeouts.forEach(clearTimeout);stopTimeouts=[];jpEmpty.forEach((cell,i)=>setTimeout(()=>jpStopReel(cell.c,cell.r,i===jpEmpty.length-1),i*50));}
+function jpStopReel(c,r,isLast){
+  DOMGrid[c][r].classList.remove('spinning');
+  if(Math.random()<.10){const val=bet*[1,2,3,5][Math.floor(Math.random()*4)];jackpotGrid[c][r]=val;jpTotal+=val;setSym(DOMGrid[c][r],{val},true);DOMGrid[c][r].classList.add('heavy-stop');sfx('obol');spawnParts(DOMGrid[c][r].parentElement,10,'#ffe566');}
+  if(isLast){clearInterval(tickInterval);const any=jpEmpty.some(cell=>jackpotGrid[cell.c][cell.r]>0);if(any){jackpotSpins=3;sfx('retrigger');setMsg('LIVES RESET!','#00f3ff');fsEl.innerText=jackpotSpins;}else setMsg('KEEP SPINNING…');setTimeout(jpSpin,gs===S_JP_STOP?400:1000);}
+}
+function endJP(){
+  gs=S_TRANS;setMsg('EVALUATING ROWS…');let full=0;
+  for(let r=0;r<ROWS;r++){let ok=true;for(let c=0;c<COLS;c++)if(jackpotGrid[c][r]===0)ok=false;if(ok){full++;for(let c=0;c<COLS;c++){DOMGrid[c][r].parentElement.classList.add('win-flash-static');spawnParts(DOMGrid[c][r].parentElement,30,'#00d4ff');}}}
+  let bonus=0,txt='',col='';
+  if(full===3){bonus=bet*1000;txt='MEGA JACKPOT!';col='#00d4ff';sfx('inferno');coinShower(150);document.body.classList.add('violent-shake');zeusLightning(6);}
+  else if(full===2){bonus=bet*100;txt='MAJOR JACKPOT!';col='#ffe566';sfx('inferno');coinShower(80);document.body.classList.add('shake');}
+  else if(full===1){bonus=bet*20;txt='MINOR JACKPOT!';col='#ff6b00';sfx('inferno');coinShower(40);}
+  setTimeout(()=>{document.body.classList.remove('shake','violent-shake');const data={totalWin:jpTotal+bonus,winningLines:[]};if(bonus>0){setMsg(txt,col);transTid=setTimeout(()=>startRollup(data),2500);}else startRollup(data);},full>0?1500:500);
+}
+
+/* ══════════════════════════════════════════
+   SHOP SYSTEM
+══════════════════════════════════════════ */
+
+// Shop upgrades — each has levels, each level costs more and boosts win chance
+const SHOP_ITEMS = [
+  {
+    id: 'lucky_charm',
+    name: "Lucky Charm",
+    icon: '🍀',
+    desc: "The gods whisper your name. Increase base win chance.",
+    maxLevel: 3,
+    baseCost: 150,
+    costMult: 2.2,
+    // bonus: extra chance to land higher-value symbols
+    effect: 'luck'
+  },
+  {
+    id: 'hermes_speed',
+    name: "Hermes' Blessing",
+    icon: '🪽',
+    desc: "Swift-footed Hermes tips the reels. Wilds appear more often.",
+    maxLevel: 3,
+    baseCost: 200,
+    costMult: 2.5,
+    effect: 'wild_rate'
+  },
+  {
+    id: 'poseidon_wave',
+    name: "Poseidon's Favour",
+    icon: '🔱',
+    desc: "The sea-god floods your paylines. Higher multipliers on wins.",
+    maxLevel: 3,
+    baseCost: 300,
+    costMult: 2.2,
+    effect: 'multiplier'
+  },
+  {
+    id: 'zeus_thunder',
+    name: "Zeus' Thunder",
+    icon: '⚡',
+    desc: "Father of the gods protects your bet. One loss prevention per session.",
+    maxLevel: 2,
+    baseCost: 400,
+    costMult: 3.0,
+    effect: 'loss_shield'
+  },
+  {
+    id: 'athena_wisdom',
+    name: "Athena's Wisdom",
+    icon: '🦉',
+    desc: "Wisdom of the owl. Scatter symbol chance greatly increased.",
+    maxLevel: 2,
+    baseCost: 350,
+    costMult: 2.8,
+    effect: 'scatter_rate'
+  },
+  {
+    id: 'midas_touch',
+    name: "Midas Touch",
+    icon: '👑',
+    desc: "Everything you touch turns to gold. Win amount bonus on all paylines.",
+    maxLevel: 3,
+    baseCost: 500,
+    costMult: 2.0,
+    effect: 'win_bonus'
+  }
+];
+
+// Current upgrade levels (0 = not bought)
+const shopLevels = {
+  lucky_charm: 0,
+  hermes_speed: 0,
+  poseidon_wave: 0,
+  zeus_thunder: 0,
+  athena_wisdom: 0,
+  midas_touch: 0
+};
+
+// Loss shield counter
+let lossShieldsLeft = 0;
+
+// Compute cost for next level of an item
+function shopItemCost(item) {
+  const lvl = shopLevels[item.id];
+  if (lvl >= item.maxLevel) return null;
+  return Math.round(item.baseCost * Math.pow(item.costMult, lvl));
+}
+
+// Get effective luck multiplier (0 to 1 range extra chance)
+function getShopEffect(effect) {
+  for (const item of SHOP_ITEMS) {
+    if (item.effect === effect) return shopLevels[item.id];
+  }
+  return 0;
+}
+
+// Modified randSym that respects shop upgrades
+const _origRandSym = randSym; // keep reference
+
+function randSymShop() {
+  const r = Math.random();
+
+  // Athena: scatter rate +0.6% per level
+  const scatterBonus = getShopEffect('scatter_rate') * 0.006;
+  // Hermes: wild rate +0.8% per level
+  const wildBonus = getShopEffect('wild_rate') * 0.008;
+  // Lucky charm: shifts symbol pool toward better symbols
+  const luckLvl = getShopEffect('luck');
+
+  const obolThresh   = 0.004;
+  const scatterThresh = 0.011 + scatterBonus;
+  const wildThresh    = 0.023 + wildBonus;
+
+  if (r < obolThresh)   return OBOL;
+  if (r < scatterThresh) return SCATTER;
+  if (r < wildThresh)   return WILD;
+
+  // Lucky charm: higher chance of premium symbols
+  if (luckLvl > 0) {
+    // Re-roll and pick from a reduced pool (fewer temples, more high symbols)
+    const premiumPool = [];
+    const luckFactor = luckLvl;
+    const base = [...symPool];
+    // Remove 2 temples per luck level to improve odds
+    for (let i = 0; i < luckFactor * 2; i++) {
+      const idx = base.indexOf('temple');
+      if (idx !== -1) base.splice(idx, 1);
+    }
+    return base[Math.floor(Math.random() * base.length)];
+  }
+
+  return symPool[Math.floor(Math.random() * symPool.length)];
+}
+
+// Override global randSym with shop version
+// We do this by patching the usage sites via a wrapper
+window._shopRandSym = randSymShop;
+
+// Patch win calculation with Midas multiplier
+function applyMidasBonus(amount) {
+  const midasLvl = getShopEffect('win_bonus');
+  if (midasLvl === 0) return amount;
+  const bonusPct = [0, 0.20, 0.45, 0.80][midasLvl] || 0;
+  return Math.round(amount * (1 + bonusPct));
+}
+
+// Patch Poseidon multiplier on lineBet
+function getPoseidonMult() {
+  const lvl = getShopEffect('multiplier');
+  return [1, 1.25, 1.55, 1.90][lvl] || 1;
+}
+
+/* ── SHOP UI ─────────────────────────────── */
+
+function openShop() {
+  if (gs !== S_IDLE) return; // only open when not spinning
+  document.getElementById('shop-bal').innerText = fmtNum(souls);
+  renderShopItems();
+  document.getElementById('shop-overlay').classList.add('open');
+}
+
+function closeShop() {
+  document.getElementById('shop-overlay').classList.remove('open');
+}
+
+function renderShopItems() {
+  const grid = document.getElementById('shop-grid');
+  grid.innerHTML = '';
+  for (const item of SHOP_ITEMS) {
+    const lvl = shopLevels[item.id];
+    const cost = shopItemCost(item);
+    const maxed = lvl >= item.maxLevel;
+    const cantAfford = !maxed && cost > souls;
+
+    const el = document.createElement('div');
+    el.className = 'shop-item' + (maxed ? ' maxed' : '') + (cantAfford ? ' cant-afford' : '');
+
+    // Active badge if any level purchased
+    const activeBadge = lvl > 0 ? '<div class="active-badge">✔ ACTIVE</div>' : '';
+
+    // Level dots
+    let dots = '';
+    for (let i = 0; i < item.maxLevel; i++) {
+      dots += `<div class="dot ${i < lvl ? 'filled' : ''}"></div>`;
+    }
+
+    // Price label
+    let priceHtml = '';
+    if (maxed) {
+      priceHtml = '<div class="shop-item-price maxed-lbl">MAXED ✦</div>';
+    } else {
+      priceHtml = `<div class="shop-item-price">⚜ ${fmtNum(cost)} souls</div>`;
+    }
+
+    el.innerHTML = `
+      ${activeBadge}
+      <div class="shop-item-icon">${item.icon}</div>
+      <div class="shop-item-name">${item.name}</div>
+      <div class="shop-item-desc">${item.desc}</div>
+      <div class="shop-item-level">${dots}</div>
+      ${priceHtml}
+    `;
+
+    if (!maxed && !cantAfford) {
+      el.addEventListener('click', () => purchaseItem(item));
+    }
+
+    grid.appendChild(el);
+  }
+}
+
+function purchaseItem(item) {
+  const cost = shopItemCost(item);
+  if (cost === null || souls < cost) return;
+
+  souls -= cost;
+  shopLevels[item.id]++;
+  credEl.innerText = souls;
+
+  // Special effect: Zeus Thunder adds a loss shield
+  if (item.effect === 'loss_shield') {
+    lossShieldsLeft++;
+  }
+
+  // Update shop display
+  document.getElementById('shop-bal').innerText = fmtNum(souls);
+  renderShopItems();
+
+  // Visual feedback
+  sfx('obol');
+  spawnFloatWin('+' + item.name, window.innerWidth / 2, window.innerHeight / 2 - 60, '1.6rem', '#ffe566');
+  coinShower(12);
+
+  // Flash panel
+  const panel = document.querySelector('.shop-panel');
+  panel.classList.remove('purchase-flash');
+  void panel.offsetWidth;
+  panel.classList.add('purchase-flash');
+}
+
+/* ── K KEY — toggle shop ──────────────────── */
+document.addEventListener('keydown', e => {
+  if (e.key === 'k' || e.key === 'K') {
+    e.preventDefault();
+    const overlay = document.getElementById('shop-overlay');
+    if (overlay.classList.contains('open')) {
+      closeShop();
+    } else {
+      openShop();
+    }
+  }
+});
+
+/* ══════════════════════════════════════════
+   PATCH GAME ENGINE WITH SHOP EFFECTS
+══════════════════════════════════════════ */
+
+// Patch randSym globally — replace all usages that go through the game loop
+// The game uses randSym() in startPhysical, visualInterval, and stopReel.
+// We override the function itself.
+const _originalRandSym = randSym;
+// Redefine randSym to use shop version
+window.randSym = function() { return randSymShop(); };
+// Since JS closures in the game code already captured the original randSym,
+// we need to override via the same variable. We'll patch the body via
+// reassigning the existing randSym reference in the global scope.
+
+// Patch checkPaylines to apply Poseidon + Midas bonuses
+const _origCheckPaylines = checkPaylines;
+window.checkPaylines = function() {
+  const result = _origCheckPaylines();
+  const posMult = getPoseidonMult();
+  const midasLvl = getShopEffect('win_bonus');
+  const bonusPct = [0, 0.20, 0.45, 0.80][midasLvl] || 0;
+  // Apply multipliers
+  let total = 0;
+  result.winningLines.forEach(line => {
+    let w = line.winAmount * posMult * (1 + bonusPct);
+    w = Math.round(w);
+    line.winAmount = w;
+    total += w;
+  });
+  result.totalWin = total;
+  return result;
+};
+
+// Patch spin() to apply Zeus loss shield
+const _origSpin = spin;
+window.spin = function() {
+  // Zeus shield: refund bet on would-be loss (applied in rollback instead — see below)
+  _origSpin();
+};
+
+// Add shop hint to status footer
+document.addEventListener('DOMContentLoaded', () => {
+  const footer = document.querySelector('.status-footer');
+  if (footer) {
+    const hint = document.createElement('span');
+    hint.className = 'shop-hint';
+    hint.innerHTML = '[<span class="kbd">K</span>] SHOP';
+    footer.appendChild(hint);
+  }
+});
+
+// Inline add hint since DOM is ready
+(function addShopHint() {
+  const footer = document.querySelector('.status-footer');
+  if (footer) {
+    const hint = document.createElement('span');
+    hint.className = 'shop-hint';
+    hint.innerHTML = '[<span class="kbd">K</span>] SHOP';
+    footer.appendChild(hint);
+  }
+})();
+
+// Zeus shield: in rollback, if no win and shield available, refund the bet
+const _origRollback = rollback;
+window.rollback = function() {
+  if (lossShieldsLeft > 0 && activeWinData && activeWinData.totalWin === 0 && !isWildRespin && !inBonus) {
+    lossShieldsLeft--;
+    souls += bet;
+    credEl.innerText = souls;
+    hudBump(credEl);
+    setMsg('⚡ Zeus Shield Activated! Bet Refunded!', '#00d4ff');
+    spawnFloatWin('SHIELDED!', window.innerWidth / 2, window.innerHeight / 3, '2rem', '#00d4ff');
+    sfx('tierHit', 1);
+  }
+  _origRollback();
+};
+
+</script>
+
+<!-- ══════════ SHOP OVERLAY ══════════ -->
+<div id="shop-overlay">
+  <div class="shop-panel">
+    <div class="shop-title">⚖ The Oracle's Market</div>
+    <div class="shop-subtitle">"Fortune favours the prepared — for a price."</div>
+    <div class="shop-balance">Your Balance: <span id="shop-bal">0</span> souls</div>
+    <div class="shop-grid" id="shop-grid"><!-- items injected by JS --></div>
+    <button class="shop-close-btn" onclick="closeShop()">Close  [K]</button>
+  </div>
+</div>
+
+</body>
+</html>
